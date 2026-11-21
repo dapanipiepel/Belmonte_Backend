@@ -16,5 +16,72 @@ services:
       retries: 10
       start_period: 120s
 
+  usuarios-service:
+    build:
+      context: ./usuarios-service
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SERVER_PORT: 8081
+      USUARIOS_DB_URL: jdbc:oracle:thin:@//oracle:1521/XEPDB1
+      USUARIOS_DB_USER: BELMONTE_USUARIOS
+      USUARIOS_DB_PASSWORD: ${USUARIOS_DB_PASSWORD:?Configure USUARIOS_DB_PASSWORD en .env}
+      JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  vehiculos-service:
+    build:
+      context: ./vehiculos-service
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SERVER_PORT: 8082
+      VEHICULOS_DB_URL: jdbc:oracle:thin:@//oracle:1521/XEPDB1
+      VEHICULOS_DB_USER: BELMONTE_VEHICULOS
+      VEHICULOS_DB_PASSWORD: ${VEHICULOS_DB_PASSWORD:?Configure VEHICULOS_DB_PASSWORD en .env}
+      JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
+      USUARIOS_SERVICE_URI: http://usuarios-service:8081
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  viajes-service:
+    build:
+      context: ./viajes-service
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SERVER_PORT: 8083
+      VIAJES_DB_URL: jdbc:oracle:thin:@//oracle:1521/XEPDB1
+      VIAJES_DB_USER: BELMONTE_VIAJES
+      VIAJES_DB_PASSWORD: ${VIAJES_DB_PASSWORD:?Configure VIAJES_DB_PASSWORD en .env}
+      JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
+      USUARIOS_SERVICE_URI: http://usuarios-service:8081
+    ports:
+      - "127.0.0.1:8083:8083"
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: ./gateway
+    environment:
+      USUARIOS_SERVICE_URI: http://usuarios-service:8081
+      VEHICULOS_SERVICE_URI: http://vehiculos-service:8082
+      VIAJES_SERVICE_URI: http://viajes-service:8083
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - usuarios-service
+      - vehiculos-service
+      - viajes-service
+
 volumes:
   oracle-data:

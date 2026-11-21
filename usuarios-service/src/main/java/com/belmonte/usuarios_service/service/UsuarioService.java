@@ -7,10 +7,12 @@ import com.belmonte.usuarios_service.model.Usuario;
 import com.belmonte.usuarios_service.repository.PersonaRepository;
 import com.belmonte.usuarios_service.repository.RolRepository;
 import com.belmonte.usuarios_service.repository.UsuarioRepository;
+import com.belmonte.usuarios_service.repository.SesionUsuarioRepository;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
 @Service
@@ -19,6 +21,7 @@ public class UsuarioService {
     private final UsuarioRepository usuarioRepository;
     private final PersonaRepository personaRepository;
     private final RolRepository rolRepository;
+    private final SesionUsuarioRepository sesionUsuarioRepository;
 
     private final BCryptPasswordEncoder passwordEncoder =
             new BCryptPasswordEncoder();
@@ -26,11 +29,13 @@ public class UsuarioService {
     public UsuarioService(
             UsuarioRepository usuarioRepository,
             PersonaRepository personaRepository,
-            RolRepository rolRepository) {
+            RolRepository rolRepository,
+            SesionUsuarioRepository sesionUsuarioRepository) {
 
         this.usuarioRepository = usuarioRepository;
         this.personaRepository = personaRepository;
         this.rolRepository = rolRepository;
+        this.sesionUsuarioRepository = sesionUsuarioRepository;
     }
 
     public Usuario registrarUsuario(Usuario usuario) {
@@ -126,5 +131,37 @@ public Usuario iniciarSesion(String email, String password) {
 
     return usuario;
 }
+
+    public int revocarSesiones(Long usuarioId) {
+        return sesionUsuarioRepository.revokeAllByUsuarioId(usuarioId);
+    }
+
+    @Transactional
+    public Usuario cambiarEstado(Long usuarioId, boolean activo) {
+        Usuario usuario = usuarioRepository.findById(usuarioId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Usuario no encontrado"));
+        usuario.setActivo(activo ? 1 : 0);
+        if (!activo) {
+            sesionUsuarioRepository.revokeAllByUsuarioId(usuarioId);
+        }
+        return usuarioRepository.save(usuario);
+    }
+
+    @Transactional
+    public Usuario cambiarRol(Long usuarioId, Long rolId) {
+        Usuario usuario = usuarioRepository.findById(usuarioId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Usuario no encontrado"));
+        Rol rol = rolRepository.findById(rolId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Rol no encontrado"));
+        if (!rol.getIdRol().equals(usuario.getRol().getIdRol())) {
+            usuario.setRol(rol);
+            usuarioRepository.save(usuario);
+            sesionUsuarioRepository.revokeAllByUsuarioId(usuarioId);
+        }
+        return usuario;
+    }
 
 }

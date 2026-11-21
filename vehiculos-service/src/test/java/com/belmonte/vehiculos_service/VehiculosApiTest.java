@@ -2,12 +2,14 @@ package com.belmonte.vehiculos_service;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.belmonte.vehiculos_service.repository.MarcaVehiculoRepository;
 import com.belmonte.vehiculos_service.repository.ModeloVehiculoRepository;
 import com.belmonte.vehiculos_service.repository.TipoVehiculoRepository;
+import com.belmonte.vehiculos_service.repository.VehiculoRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -16,12 +18,13 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
 @SpringBootTest
-@AutoConfigureMockMvc
+@AutoConfigureMockMvc(addFilters = false)
 class VehiculosApiTest {
     @Autowired private MockMvc mvc;
     @Autowired private TipoVehiculoRepository tipos;
     @Autowired private MarcaVehiculoRepository marcas;
     @Autowired private ModeloVehiculoRepository modelos;
+    @Autowired private VehiculoRepository vehiculos;
 
     @Test
     void createsCatalogsAndVehiclesAndValidatesRequests() throws Exception {
@@ -71,5 +74,19 @@ class VehiculosApiTest {
                 .andExpect(status().isOk()).andExpect(jsonPath("$[?(@.patente == 'ZZZZ-99')]").exists());
         mvc.perform(get("/api/vehiculos"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$[?(@.patente == 'ZZZZ-99')]").doesNotExist());
+        Long vehiculoId = vehiculoServiceId();
+        mvc.perform(patch("/api/vehiculos/" + vehiculoId + "/estado")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"activo\":true}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activo").value(true));
+    }
+
+    private Long vehiculoServiceId() {
+        return vehiculos.findAll().stream()
+                .filter(vehiculo -> vehiculo.getPatente().equals("ZZZZ-99"))
+                .findFirst()
+                .orElseThrow()
+                .getId();
     }
 }

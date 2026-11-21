@@ -2,6 +2,7 @@ package com.belmonte.vehiculos_service.controller;
 
 import com.belmonte.vehiculos_service.dto.VehiculoRequest;
 import com.belmonte.vehiculos_service.dto.VehiculoResponse;
+import com.belmonte.vehiculos_service.dto.VehiculoEstadoRequest;
 import com.belmonte.vehiculos_service.service.VehiculoService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -40,6 +41,14 @@ public class VehiculoController {
     @PostMapping
     public ResponseEntity<VehiculoResponse> crearVehiculo(@Valid @RequestBody VehiculoRequest vehiculo) {
         return ResponseEntity.status(HttpStatus.CREATED).body(VehiculoResponse.from(vehiculoService.guardar(vehiculo)));
+    }
+
+    @PatchMapping("/{id}/estado")
+    public ResponseEntity<VehiculoResponse> cambiarEstado(
+            @PathVariable Long id,
+            @Valid @RequestBody VehiculoEstadoRequest request) {
+        return ResponseEntity.ok(VehiculoResponse.from(
+                vehiculoService.cambiarEstado(id, request.activo())));
     }
 
 }

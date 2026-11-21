@@ -62,4 +62,5 @@ public class Vehiculo {
     public String getColor() { return color; }
     public Integer getCapacidadPasajeros() { return capacidadPasajeros; }
     public Boolean getActivo() { return activo; }
+    public void setActivo(Boolean activo) { this.activo = activo; }
 }

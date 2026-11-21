@@ -69,9 +69,10 @@ class UsuariosOracleMigrationTest {
             try (ResultSet result = statement.executeQuery(
                     "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME IN "
                     + "('PAISES', 'REGIONES', 'COMUNAS', 'EMPRESAS', 'ROLES', "
-                    + "'TIPOS_DOCUMENTO', 'PERSONAS', 'USUARIOS', 'PASAJEROS')")) {
+                    + "'TIPOS_DOCUMENTO', 'PERSONAS', 'USUARIOS', 'PASAJEROS', "
+                    + "'SESIONES_USUARIO')")) {
                 assertTrue(result.next());
-                assertEquals(9, result.getInt(1));
+                assertEquals(10, result.getInt(1));
             }
 
             statement.executeUpdate("INSERT INTO paises (nombre_pais) VALUES ('Pais de prueba')");
@@ -85,6 +86,10 @@ class UsuariosOracleMigrationTest {
                     + "SELECT p.id_persona, r.id_rol, 'test-only' FROM personas p CROSS JOIN roles r");
             statement.executeUpdate("INSERT INTO pasajeros (persona_id, empresa_id) "
                     + "SELECT p.id_persona, e.id_empresa FROM personas p CROSS JOIN empresas e");
+            statement.executeUpdate("INSERT INTO sesiones_usuario "
+                    + "(sesion_id, usuario_id, fecha_inicio, fecha_expiracion, activa) "
+                    + "SELECT 'test-session', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, 1 "
+                    + "FROM usuarios");
 
             assertEquals(1, assertThrows(SQLException.class, () -> statement.executeUpdate(
                     "INSERT INTO paises (nombre_pais) VALUES ('Pais de prueba')")).getErrorCode());

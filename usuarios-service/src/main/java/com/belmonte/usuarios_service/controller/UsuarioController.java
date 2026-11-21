@@ -9,11 +9,14 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import java.util.List;
-import org.springframework.http.HttpStatus;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.util.Map;
+import com.belmonte.usuarios_service.dto.UsuarioEstadoRequest;
+import com.belmonte.usuarios_service.dto.UsuarioRolRequest;
+import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.PatchMapping;
 
 @RestController
 @RequestMapping("/api/usuarios")
@@ -58,37 +61,35 @@ public List<Map<String, Object>> listarUsuarios() {
             ))
             .toList();
 }
-
-
-@PostMapping("/login")
-public Map<String, Object> iniciarSesion(
-        @RequestBody Map<String, String> datos) {
-
-    String email = datos.get("email");
-    String password = datos.get("password");
-
-    if (email == null || email.isBlank()
-            || password == null || password.isBlank()) {
-        throw new ResponseStatusException(
-                HttpStatus.BAD_REQUEST,
-                "Debe ingresar correo y contrasena"
+    
+    @PostMapping("/{id}/revocar-sesiones")
+    public Map<String, Object> revocarSesiones(@PathVariable("id") Long usuarioId) {
+        int sesionesRevocadas = usuarioService.revocarSesiones(usuarioId);
+        return Map.of(
+                "usuarioId", usuarioId,
+                "sesionesRevocadas", sesionesRevocadas
         );
     }
 
-    Usuario usuario = usuarioService.iniciarSesion(
-            email, password
-    );
+    @PatchMapping("/{id}/estado")
+    public Map<String, Object> cambiarEstado(
+            @PathVariable("id") Long usuarioId,
+            @Valid @RequestBody UsuarioEstadoRequest request) {
+        Usuario usuario = usuarioService.cambiarEstado(usuarioId, request.activo());
+        return Map.of(
+                "idUsuario", usuario.getIdUsuario(),
+                "activo", usuario.getActivo()
+        );
+    }
 
-    return Map.of(
-            "mensaje", "Inicio de sesion correcto",
-            "idUsuario", usuario.getIdUsuario(),
-            "idPersona", usuario.getPersona().getIdPersona(),
-            "nombreCompleto",
-            usuario.getPersona().getNombreCompleto(),
-            "email", usuario.getPersona().getEmail(),
-            "rol", usuario.getRol().getNombreRol(),
-            "activo", usuario.getActivo()
-    );
-}
-
+    @PatchMapping("/{id}/rol")
+    public Map<String, Object> cambiarRol(
+            @PathVariable("id") Long usuarioId,
+            @Valid @RequestBody UsuarioRolRequest request) {
+        Usuario usuario = usuarioService.cambiarRol(usuarioId, request.rolId());
+        return Map.of(
+                "idUsuario", usuario.getIdUsuario(),
+                "rol", usuario.getRol().getNombreRol()
+        );
+    }
 }
