@@ -1,0 +1,27 @@
+server:
+  address: 127.0.0.1
+  port: 8080
+
+spring:
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: 3000
+            response-timeout: 10s
+          routes:
+            - id: usuarios
+              uri: ${USUARIOS_SERVICE_URI}
+              predicates:
+                - Path=/api/auth/**,/api/usuarios/**,/api/personas/**,/api/roles/**,/api/paises/**,/api/tipos-documento/**,/api/comunas/**,/api/empresas/**,/api/pasajeros/**,/api/conductores/**
+            - id: vehiculos
+              uri: ${VEHICULOS_SERVICE_URI}
+              predicates:
+                - Path=/api/vehiculos/**
+            - id: viajes
+              uri: ${VIAJES_SERVICE_URI}
+              predicates:
+                - Path=/api/traslados/**
