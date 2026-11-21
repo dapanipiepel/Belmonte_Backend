@@ -29,6 +29,7 @@ import java.util.List;
 @Component
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
+
     private final SecretKey key;
     private final String usuariosServiceUri;
     private final String internalApiSecret;
@@ -65,7 +66,10 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                     .header("X-Belmonte-Internal-Secret", internalApiSecret)
                     .GET()
                     .build();
-            return httpClient.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
+            int status = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.discarding()).statusCode();
+            return status == 200;
         } catch (Exception exception) {
             return false;
         }
@@ -85,9 +89,22 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                         .build()
                         .parseSignedClaims(authorization.substring(7))
                         .getPayload();
-                @SuppressWarnings("unchecked")
-                List<String> roles = claims.get("roles", List.class);
-                String sessionId = claims.get("sessionId", String.class);
+                Object rolesClaim = claims.get("roles");
+                if (!(rolesClaim instanceof List<?> rolesList)) {
+                    SecurityContextHolder.clearContext();
+                    filterChain.doFilter(request, response);
+                    return;
+                }
+                List<String> roles = rolesList.stream()
+                        .filter(String.class::isInstance)
+                        .map(String.class::cast)
+                        .toList();
+                Object sessionClaim = claims.get("sessionId");
+                if (!(sessionClaim instanceof String sessionId)) {
+                    SecurityContextHolder.clearContext();
+                    filterChain.doFilter(request, response);
+                    return;
+                }
                 if (!sessionIsActive(sessionId)) {
                     SecurityContextHolder.clearContext();
                     filterChain.doFilter(request, response);

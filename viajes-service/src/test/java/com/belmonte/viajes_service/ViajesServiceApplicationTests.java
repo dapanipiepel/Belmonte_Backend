@@ -28,6 +28,6 @@ class ViajesServiceApplicationTests {
 		mvc.perform(post("/api/viajes")).andExpect(status().isNotFound());
 		mvc.perform(put("/api/viajes/1/asignar")).andExpect(status().isNotFound());
 		mvc.perform(put("/api/viajes/1/estado")).andExpect(status().isNotFound());
-		mvc.perform(get("/api/traslados")).andExpect(status().isNotFound());
+		mvc.perform(get("/api/traslados")).andExpect(status().isUnauthorized());
 	}
 }

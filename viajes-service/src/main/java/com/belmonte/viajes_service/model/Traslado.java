@@ -97,4 +97,18 @@ public class Traslado {
     public OffsetDateTime getFechaCreacion() { return fechaCreacion; }
     public OffsetDateTime getFechaActualizacion() { return fechaActualizacion; }
     public Set<Long> getPasajeros() { return Set.copyOf(pasajeros); }
+
+    public void asignar(Long conductorId, Long vehiculoId) {
+        this.conductorId = conductorId;
+        this.vehiculoId = vehiculoId;
+    }
+
+    public void cambiarRuta(Ubicacion origen, Ubicacion destino,
+                            OffsetDateTime fechaHoraViaje,
+                            OffsetDateTime fechaHoraTerminoEstimado) {
+        this.origen = origen;
+        this.destino = destino;
+        this.fechaHoraViaje = fechaHoraViaje;
+        this.fechaHoraTerminoEstimado = fechaHoraTerminoEstimado;
+    }
 }
