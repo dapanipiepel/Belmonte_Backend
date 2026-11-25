@@ -1,5 +1,6 @@
 package com.belmonte.viajes_service.security;
 
+import jakarta.servlet.DispatcherType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpStatus;
@@ -35,6 +36,7 @@ public class SecurityConfig {
                             response.getWriter().write("{\"error\":\"Acceso denegado\"}");
                         }))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers("/api/traslados/**").authenticated()
                         .anyRequest().authenticated())
                 .addFilterBefore(jwtAuthenticationFilter,
