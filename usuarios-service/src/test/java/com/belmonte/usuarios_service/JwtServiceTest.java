@@ -10,6 +10,7 @@ import io.jsonwebtoken.ExpiredJwtException;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.time.Instant;
 
 class JwtServiceTest {
 
@@ -42,5 +43,17 @@ class JwtServiceTest {
 
         Thread.sleep(10);
         assertThrows(ExpiredJwtException.class, () -> jwtService.parseToken(token));
+    }
+
+    @Test
+    void tokenSeEmiteYValidaConLaReferenciaRecibida() {
+        JwtService jwtService = new JwtService(
+                "0123456789abcdef0123456789abcdef0123456789abcdef", 60000);
+        Instant inicio = Instant.parse("2030-01-02T03:04:05.123Z");
+        String token = jwtService.createToken("prueba@example.invalid", 42L, "session-42",
+                List.of("ADMINISTRADOR"), inicio);
+        Claims claims = jwtService.parseToken(token, inicio.plusSeconds(30));
+        assertEquals(Instant.parse("2030-01-02T03:05:05Z"), claims.getExpiration().toInstant());
+        assertThrows(ExpiredJwtException.class, () -> jwtService.parseToken(token, inicio.plusSeconds(61)));
     }
 }

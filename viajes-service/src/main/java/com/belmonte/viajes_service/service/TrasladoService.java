@@ -8,16 +8,17 @@ import com.belmonte.viajes_service.dto.UbicacionRequest;
 import com.belmonte.viajes_service.model.EstadoTraslado;
 import com.belmonte.viajes_service.model.HistorialEstado;
 import com.belmonte.viajes_service.model.OperacionTraslado;
-import com.belmonte.viajes_service.model.RecursoTraslado;
 import com.belmonte.viajes_service.model.Traslado;
 import com.belmonte.viajes_service.model.Ubicacion;
 import com.belmonte.viajes_service.repository.EstadoTrasladoRepository;
+import com.belmonte.viajes_service.repository.BarreraRecursoRepository;
 import com.belmonte.viajes_service.repository.HistorialEstadoRepository;
 import com.belmonte.viajes_service.repository.OperacionTrasladoRepository;
-import com.belmonte.viajes_service.repository.RecursoTrasladoRepository;
 import com.belmonte.viajes_service.repository.TrasladoRepository;
 import com.belmonte.viajes_service.repository.UbicacionRepository;
 import org.springframework.http.HttpStatus;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
@@ -27,6 +28,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.Objects;
 
 @Service
 public class TrasladoService {
@@ -38,20 +40,23 @@ public class TrasladoService {
     private final EstadoTrasladoRepository estadoRepository;
     private final HistorialEstadoRepository historialRepository;
     private final OperacionTrasladoRepository operacionRepository;
-    private final RecursoTrasladoRepository recursoRepository;
+    private final JdbcTemplate jdbc;
+    private final BarreraRecursoRepository barreras;
 
     public TrasladoService(TrasladoRepository trasladoRepository,
                            UbicacionRepository ubicacionRepository,
                            EstadoTrasladoRepository estadoRepository,
                            HistorialEstadoRepository historialRepository,
                            OperacionTrasladoRepository operacionRepository,
-                           RecursoTrasladoRepository recursoRepository) {
+                           JdbcTemplate jdbc,
+                           BarreraRecursoRepository barreras) {
         this.trasladoRepository = trasladoRepository;
         this.ubicacionRepository = ubicacionRepository;
         this.estadoRepository = estadoRepository;
         this.historialRepository = historialRepository;
         this.operacionRepository = operacionRepository;
-        this.recursoRepository = recursoRepository;
+        this.jdbc = jdbc;
+        this.barreras = barreras;
     }
 
     @Transactional
@@ -61,7 +66,7 @@ public class TrasladoService {
             Optional<OperacionTraslado> repetida =
                     operacionRepository.findByClave(idempotencyKey);
             if (repetida.isPresent()) {
-                if (!repetida.get().getActorId().equals(solicitanteId)
+                if (!Objects.equals(repetida.get().getActorId(), solicitanteId)
                         || !"crear".equals(repetida.get().getOperacion())) {
                     throw new ResponseStatusException(
                             HttpStatus.CONFLICT, "Clave de idempotencia reutilizada");
@@ -111,9 +116,7 @@ public class TrasladoService {
                 traslado, pendiente, solicitanteId, null));
 
         if (idempotencyKey != null) {
-            operacionRepository.save(new OperacionTraslado(
-                    idempotencyKey, solicitanteId, "crear",
-                    traslado.getId(), 201));
+            registrarOperacion(idempotencyKey, solicitanteId, "crear", traslado.getId(), 201);
         }
         return traslado;
     }
@@ -151,11 +154,9 @@ public class TrasladoService {
                 .orElse("PENDIENTE");
     }
 
-    @Transactional
-    public Traslado asignar(Long trasladoId, AsignacionRequest request,
-                            Long actorId, String idempotencyKey) {
-        validarClaveIdempotencia(idempotencyKey, actorId, "asignar");
-
+    public Traslado asignar(Long trasladoId, AsignacionRequest request, Long actorId,
+                            String barreraConductor, String barreraVehiculo) {
+        bloquearOperaciones();
         Traslado traslado = trasladoRepository.findById(trasladoId)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND, "Traslado no encontrado"));
@@ -164,6 +165,12 @@ public class TrasladoService {
                 && !"EN_CURSO".equals(estado)) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT, "El traslado no admite reasignacion");
+        }
+        if (barreras.existsByTipoRecursoAndRecursoIdAndEstadoAndOperacionIdNot(
+                "CONDUCTOR", request.conductorId(), "ABIERTA", barreraConductor)
+                || barreras.existsByTipoRecursoAndRecursoIdAndEstadoAndOperacionIdNot(
+                        "VEHICULO", request.vehiculoId(), "ABIERTA", barreraVehiculo)) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Recurso con operacion pendiente");
         }
 
         OffsetDateTime inicio = traslado.getFechaHoraViaje()
@@ -175,26 +182,15 @@ public class TrasladoService {
         verificarSolapamientos(
                 request.conductorId(), request.vehiculoId(),
                 trasladoId, inicio, termino);
-        Long conductorAnterior = traslado.getConductorId();
-        Long vehiculoAnterior = traslado.getVehiculoId();
-        bloquearRecurso("CONDUCTOR", request.conductorId());
-        bloquearRecurso("VEHICULO", request.vehiculoId());
-        if (conductorAnterior != null
-                && !conductorAnterior.equals(request.conductorId())) {
-            liberarRecurso("CONDUCTOR", conductorAnterior);
-        }
-        if (vehiculoAnterior != null
-                && !vehiculoAnterior.equals(request.vehiculoId())) {
-            liberarRecurso("VEHICULO", vehiculoAnterior);
+        if ("EN_CURSO".equals(estado)) {
+            verificarRecursosEnCurso(request.conductorId(), request.vehiculoId(), trasladoId);
         }
 
         traslado.asignar(request.conductorId(), request.vehiculoId());
         traslado = trasladoRepository.saveAndFlush(traslado);
         registrarEstado(
-                traslado, "ASIGNADO", actorId,
-                "ASIGNADO".equals(estado) ? "Reasignacion" : null);
-        registrarOperacion(idempotencyKey, actorId, "asignar",
-                trasladoId, 200);
+                traslado, "EN_CURSO".equals(estado) ? "EN_CURSO" : "ASIGNADO", actorId,
+                "PENDIENTE".equals(estado) ? null : "Reasignacion");
         return traslado;
     }
 
@@ -203,6 +199,7 @@ public class TrasladoService {
                                   Long actorId, Long conductorId,
                                   String idempotencyKey) {
         validarClaveIdempotencia(idempotencyKey, actorId, "estado");
+        bloquearOperaciones();
 
         Traslado traslado = trasladoRepository.findById(trasladoId)
                 .orElseThrow(() -> new ResponseStatusException(
@@ -221,9 +218,8 @@ public class TrasladoService {
                     "Transicion invalida desde " + estadoActual);
         }
 
-        if ("FINALIZADO".equals(nuevo) || "CANCELADO".equals(nuevo)) {
-            liberarRecurso("CONDUCTOR", traslado.getConductorId());
-            liberarRecurso("VEHICULO", traslado.getVehiculoId());
+        if ("EN_CURSO".equals(nuevo)) {
+            verificarRecursosEnCurso(traslado.getConductorId(), traslado.getVehiculoId(), trasladoId);
         }
 
         registrarEstado(
@@ -236,19 +232,21 @@ public class TrasladoService {
 
     @Transactional
     public Traslado cancelar(Long trasladoId, CancelacionRequest request,
-                             Long actorId, String idempotencyKey) {
+                             Long actorId, boolean administrador, boolean conductor,
+                             String idempotencyKey) {
         validarClaveIdempotencia(idempotencyKey, actorId, "cancelar");
+        bloquearOperaciones();
         Traslado traslado = trasladoRepository.findById(trasladoId)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND, "Traslado no encontrado"));
+        if (!administrador && !traslado.getSolicitanteId().equals(actorId)
+                && !(conductor && actorId.equals(traslado.getConductorId()))) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Sin permiso para cancelar el traslado");
+        }
         String estado = estadoActual(traslado);
         if (!List.of("PENDIENTE", "ASIGNADO", "EN_CURSO").contains(estado)) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT, "El traslado no admite cancelacion");
-        }
-        if (traslado.getConductorId() != null) {
-            liberarRecurso("CONDUCTOR", traslado.getConductorId());
-            liberarRecurso("VEHICULO", traslado.getVehiculoId());
         }
         registrarEstado(
                 traslado, "CANCELADO", actorId, request.motivo());
@@ -306,33 +304,26 @@ public class TrasladoService {
         }
     }
 
-    private void bloquearRecurso(String tipo, Long recursoId) {
-        RecursoTraslado recurso = recursoRepository.findById(
-                        new RecursoTraslado.RecursoId(tipo, recursoId))
-                .orElse(new RecursoTraslado(tipo, recursoId, "LIBRE"));
-        if ("BLOQUEADO".equals(recurso.getEstado())) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "El recurso esta bloqueado por una operacion");
-        }
-        recurso.setEstado("BLOQUEADO");
-        recursoRepository.save(recurso);
+    private void bloquearOperaciones() {
+        estadoRepository.lockOperaciones().orElseThrow(() -> new ResponseStatusException(
+                HttpStatus.INTERNAL_SERVER_ERROR, "Estado PENDIENTE no configurado"));
     }
 
-    private void liberarRecurso(String tipo, Long recursoId) {
-        if (recursoId == null) return;
-        RecursoTraslado recurso = recursoRepository.findById(
-                        new RecursoTraslado.RecursoId(tipo, recursoId))
-                .orElse(new RecursoTraslado(tipo, recursoId, "LIBRE"));
-        recurso.setEstado("LIBRE");
-        recursoRepository.save(recurso);
+    private void verificarRecursosEnCurso(Long conductorId, Long vehiculoId, Long trasladoId) {
+        boolean ocupado = trasladoRepository.findByConductorId(conductorId).stream()
+                .anyMatch(t -> !t.getId().equals(trasladoId) && "EN_CURSO".equals(estadoActual(t)))
+                || trasladoRepository.findByVehiculoId(vehiculoId).stream()
+                .anyMatch(t -> !t.getId().equals(trasladoId) && "EN_CURSO".equals(estadoActual(t)));
+        if (ocupado) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Hay un viaje en curso con esos recursos");
+        }
     }
 
     private void validarClaveIdempotencia(String clave, Long actorId,
                                           String operacion) {
         if (clave == null) return;
         operacionRepository.findByClave(clave).ifPresent(previa -> {
-            if (!previa.getActorId().equals(actorId)
+            if (!Objects.equals(previa.getActorId(), actorId)
                     || !previa.getOperacion().equals(operacion)) {
                 throw new ResponseStatusException(
                         HttpStatus.CONFLICT,
@@ -345,9 +336,21 @@ public class TrasladoService {
                                     String operacion, Long trasladoId,
                                     Integer respuestaCodigo) {
         if (clave != null) {
-            operacionRepository.save(new OperacionTraslado(
-                    clave, actorId, operacion,
-                    trasladoId, respuestaCodigo));
+            int actualizadas = jdbc.update("""
+                    UPDATE operaciones_traslados SET traslado_id = ?, respuesta_codigo = ?
+                    WHERE clave = ? AND actor_id = ? AND operacion = ?
+                    """, trasladoId, respuestaCodigo, clave, actorId, operacion);
+            if (actualizadas == 0) {
+                try {
+                    jdbc.update("""
+                            INSERT INTO operaciones_traslados
+                            (clave, actor_id, operacion, traslado_id, respuesta_codigo, creado_en)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """, clave, actorId, operacion, trasladoId, respuestaCodigo, OffsetDateTime.now());
+                } catch (DuplicateKeyException exception) {
+                    throw new ResponseStatusException(HttpStatus.CONFLICT, "Clave de idempotencia reutilizada");
+                }
+            }
         }
     }
 

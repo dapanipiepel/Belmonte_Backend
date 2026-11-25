@@ -50,7 +50,7 @@ class GatewayRoutingTest {
 
     @Test
     void routesKnownPathsAndPreservesUpstreamErrors() throws Exception {
-        for (String path : List.of("/api/auth/login", "/api/usuarios", "/api/usuarios/1",
+        for (String path : List.of("/api/auth/login", "/api/auth/logout", "/api/usuarios", "/api/usuarios/1",
                 "/api/personas", "/api/roles", "/api/paises", "/api/tipos-documento",
                 "/api/comunas", "/api/empresas", "/api/pasajeros", "/api/conductores")) {
             assertResponse(path, 200, "usuarios:" + path);
@@ -61,6 +61,20 @@ class GatewayRoutingTest {
         assertResponse("/api/traslados/42", 200, "viajes:/api/traslados/42");
         assertResponse("/api/vehiculos/failure", 503, "vehiculos:/api/vehiculos/failure");
         assertEquals(404, send("/api/unknown").statusCode());
+        assertEquals(404, send("/api/auth/sessions/activa/validate").statusCode());
+        assertEquals(404, send("/internal/conductores/1").statusCode());
+        assertEquals(404, send("/internal/vehiculos/1").statusCode());
+        assertEquals(404, send("/internal/barreras/123").statusCode());
+        HttpRequest internalPrepare = HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + port + "/internal/barreras/123"))
+                .PUT(HttpRequest.BodyPublishers.noBody()).build();
+        assertEquals(404, HttpClient.newHttpClient()
+                .send(internalPrepare, HttpResponse.BodyHandlers.discarding()).statusCode());
+        HttpRequest internalClose = HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + port + "/internal/barreras/123/cerrar"))
+                .POST(HttpRequest.BodyPublishers.noBody()).build();
+        assertEquals(404, HttpClient.newHttpClient()
+                .send(internalClose, HttpResponse.BodyHandlers.discarding()).statusCode());
         assertEquals(404, send("/api/viajes").statusCode());
     }
 

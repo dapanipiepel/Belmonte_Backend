@@ -11,6 +11,8 @@ import java.util.List;
 public interface TrasladoRepository extends JpaRepository<Traslado, Long> {
     List<Traslado> findBySolicitanteIdOrderByFechaHoraViajeDesc(Long solicitanteId);
     List<Traslado> findByConductorIdOrderByFechaHoraViajeDesc(Long conductorId);
+    List<Traslado> findByConductorId(Long conductorId);
+    List<Traslado> findByVehiculoId(Long vehiculoId);
 
     @Query("""
             SELECT t FROM Traslado t

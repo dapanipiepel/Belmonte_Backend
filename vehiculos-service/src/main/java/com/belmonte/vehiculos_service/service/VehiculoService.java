@@ -51,17 +51,4 @@ public class VehiculoService {
                 request.color(), request.capacidadPasajeros(), request.activo() == null || request.activo()));
     }
 
-    @Transactional
-    public Vehiculo cambiarEstado(Long id, boolean activo) {
-        Vehiculo vehiculo = vehiculoRepository.findById(id)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND, "Vehiculo no encontrado"));
-        if (!activo) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "La desactivacion requiere el protocolo de asignacion y viajes");
-        }
-        vehiculo.setActivo(activo);
-        return vehiculoRepository.saveAndFlush(vehiculo);
-    }
 }

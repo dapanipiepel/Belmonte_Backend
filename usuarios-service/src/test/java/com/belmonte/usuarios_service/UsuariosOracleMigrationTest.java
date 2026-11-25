@@ -11,8 +11,20 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Future;
 
 import com.belmonte.usuarios_service.repository.PersonaRepository;
+import com.belmonte.usuarios_service.repository.UsuarioRepository;
+import com.belmonte.usuarios_service.service.CambioUsuarioTransacciones;
+import com.belmonte.usuarios_service.service.JwtService;
+import com.belmonte.usuarios_service.service.DecisionAutorizacionService;
+import com.belmonte.usuarios_service.service.UsuarioService;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -22,12 +34,16 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.server.ResponseStatusException;
 
 @EnabledIfEnvironmentVariable(named = "BELMONTE_ORACLE_TEST_URL", matches = ".+")
 class UsuariosOracleMigrationTest {
 
     @Test
-    void migratesAnEmptyTestSchemaAndEnforcesItsConstraints() throws SQLException {
+    void migratesAnEmptyTestSchemaAndEnforcesItsConstraints() throws Exception {
         String url = System.getenv("BELMONTE_ORACLE_TEST_URL");
         String username = Objects.requireNonNull(System.getenv("BELMONTE_ORACLE_TEST_USER"));
         String password = Objects.requireNonNull(System.getenv("BELMONTE_ORACLE_TEST_PASSWORD"));
@@ -42,17 +58,72 @@ class UsuariosOracleMigrationTest {
                 assertEquals(0, result.getInt(2), "The test schema must be empty");
             }
         }
+        Flyway.configure().dataSource(url, username, password).target("3").load().migrate();
+        try (Connection connection = DriverManager.getConnection(url, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("INSERT INTO operaciones_cambio_usuario "
+                    + "(clave, actor_id, usuario_id, solicitud_hash, barrera_id, proposito, estado) "
+                    + "VALUES ('legacy-pendiente', 1, 1, 'hash', 'legacy', 'BAJA', 'PENDIENTE')");
+        }
+        Flyway.configure().dataSource(url, username, password).target("4").load().migrate();
+        try (Connection connection = DriverManager.getConnection(url, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("INSERT INTO operaciones_cambio_usuario "
+                    + "(clave, estado, sesion_original, tipo_solicitud, solicitud_activo) "
+                    + "VALUES ('sin-vencimiento', 'PENDIENTE', 'sesion', 'ESTADO', 0)");
+        }
+        Flyway.configure().dataSource(url, username, password).target("5").load().migrate();
+        Flyway.configure().dataSource(url, username, password).target("6").load().migrate();
+        try (Connection connection = DriverManager.getConnection(url, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("INSERT INTO decisiones_autorizacion "
+                    + "(decision_id, actor_id, sesion_id, solicitud_hash, jwt_expira_en, sesion_expira_en, estado) "
+                    + "VALUES ('VEHICULOS_ESTADO:antigua', 1, 'sesion-antigua', '" + "a".repeat(64)
+                    + "', TO_TIMESTAMP_TZ('2030-01-02 03:04:05 +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), "
+                    + "TIMESTAMP '2030-01-02 03:04:05', 'PREPARADA')");
+            statement.executeUpdate("INSERT INTO paises (nombre_pais) VALUES ('Pais migracion sesion')");
+            statement.executeUpdate("INSERT INTO tipos_documento (codigo_tipo) VALUES ('MIGSES')");
+            statement.executeUpdate("INSERT INTO roles (nombre_rol) VALUES ('ROL_MIG_SES')");
+            statement.executeUpdate("INSERT INTO personas (pais_documento_id, tipo_documento_id, rut_dni, nombre_completo, email) "
+                    + "SELECT p.id_pais, t.id_tipo_documento, 'MIG-1', 'Migracion', 'migracion@example.invalid' "
+                    + "FROM paises p CROSS JOIN tipos_documento t WHERE p.nombre_pais = 'Pais migracion sesion' AND t.codigo_tipo = 'MIGSES'");
+            statement.executeUpdate("INSERT INTO usuarios (persona_id, rol_id, password) "
+                    + "SELECT p.id_persona, r.id_rol, 'test' FROM personas p CROSS JOIN roles r "
+                    + "WHERE p.email = 'migracion@example.invalid' AND r.nombre_rol = 'ROL_MIG_SES'");
+            statement.executeUpdate("INSERT INTO sesiones_usuario (sesion_id, usuario_id, fecha_inicio, fecha_expiracion, activa) "
+                    + "SELECT 'antigua-activa', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, 1 FROM usuarios");
+            statement.executeUpdate("INSERT INTO sesiones_usuario (sesion_id, usuario_id, fecha_inicio, fecha_expiracion, activa) "
+                    + "SELECT 'antigua-inactiva', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, 0 FROM usuarios");
+        }
+        Flyway.configure().dataSource(url, username, password).target("7").load().migrate();
+        try (Connection connection = DriverManager.getConnection(url, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("INSERT INTO sesiones_usuario "
+                    + "(sesion_id, usuario_id, fecha_inicio, fecha_expiracion, fecha_expiracion_instante, activa) "
+                    + "SELECT 'sesion-v7', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, SYSTIMESTAMP + 1, 1 FROM usuarios");
+        }
+        Flyway.configure().dataSource(url, username, password).target("8").load().migrate();
+        try (Connection connection = DriverManager.getConnection(url, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("INSERT INTO decisiones_autorizacion "
+                    + "(decision_id, actor_id, sesion_id, solicitud_hash, jwt_expira_en, sesion_expira_en, sesion_expira_instante, estado) "
+                    + "VALUES ('VEHICULOS_ESTADO:autorizada-v8', 1, 'sesion-v7', '" + "a".repeat(64)
+                    + "', TO_TIMESTAMP_TZ('2030-01-02 03:04:05 +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), "
+                    + "TIMESTAMP '2030-01-02 03:04:05', "
+                    + "TO_TIMESTAMP_TZ('2030-01-02 03:04:05 +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), 'AUTORIZADA')");
+        }
 
         ConfigurableEnvironment environment = new StandardEnvironment();
         environment.getPropertySources().addFirst(new MapPropertySource("oracleTest", Map.of(
                 "USUARIOS_DB_URL", url,
                 "USUARIOS_DB_USER", username,
-                "USUARIOS_DB_PASSWORD", password)));
+                "USUARIOS_DB_PASSWORD", password,
+                "server.port", "0")));
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(UsuariosServiceApplication.class)
                 .environment(environment)
                 .profiles("oracle")
-                .web(WebApplicationType.NONE)
+                .web(WebApplicationType.SERVLET)
                 .run()) {
             Flyway flyway = Flyway.configure().dataSource(url, username, password).load();
             assertEquals(0, flyway.migrate().migrationsExecuted);
@@ -62,10 +133,67 @@ class UsuariosOracleMigrationTest {
     }
 
     private void verifyConstraintsAndRepository(String url, String username, String password,
-                                                ConfigurableApplicationContext context) throws SQLException {
+                                                ConfigurableApplicationContext context) throws Exception {
         try (Connection connection = DriverManager.getConnection(url, username, password);
              Statement statement = connection.createStatement()) {
             connection.setAutoCommit(false);
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM operaciones_cambio_usuario WHERE clave = 'legacy-pendiente' "
+                    + "AND estado = 'PENDIENTE' AND sesion_original IS NULL AND tipo_solicitud IS NULL "
+                    + "AND solicitud_activo IS NULL AND solicitud_rol_id IS NULL AND jwt_original_expira_en IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM operaciones_cambio_usuario WHERE clave = 'sin-vencimiento' "
+                    + "AND sesion_original = 'sesion' AND jwt_original_expira_en IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM decisiones_autorizacion WHERE decision_id = 'VEHICULOS_ESTADO:antigua' "
+                    + "AND sesion_expira_instante IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM decisiones_autorizacion WHERE decision_id = 'VEHICULOS_ESTADO:autorizada-v8' "
+                    + "AND estado = 'AUTORIZADA' AND tiempo_limite_superior IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "UPDATE decisiones_autorizacion SET tiempo_limite_superior = jwt_expira_en "
+                    + "WHERE decision_id = 'VEHICULOS_ESTADO:autorizada-v8'")).getErrorCode());
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM sesiones_usuario WHERE sesion_id IN ('antigua-activa', 'antigua-inactiva') "
+                    + "AND activa = 0 AND fecha_expiracion_instante IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(2, result.getInt(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM sesiones_usuario WHERE sesion_id = 'sesion-v7' "
+                    + "AND activa = 1 AND fecha_expiracion_instante IS NOT NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "UPDATE sesiones_usuario SET activa = 1 WHERE sesion_id = 'antigua-activa'")).getErrorCode());
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "UPDATE sesiones_usuario SET fecha_expiracion_instante = NULL WHERE sesion_id = 'sesion-v7'")).getErrorCode());
+            statement.executeUpdate("DELETE FROM sesiones_usuario WHERE sesion_id IN ('antigua-activa', 'antigua-inactiva', 'sesion-v7')");
+            statement.executeUpdate("DELETE FROM usuarios WHERE persona_id = (SELECT id_persona FROM personas WHERE email = 'migracion@example.invalid')");
+            statement.executeUpdate("DELETE FROM personas WHERE email = 'migracion@example.invalid'");
+            statement.executeUpdate("DELETE FROM roles WHERE nombre_rol = 'ROL_MIG_SES'");
+            statement.executeUpdate("DELETE FROM tipos_documento WHERE codigo_tipo = 'MIGSES'");
+            statement.executeUpdate("DELETE FROM paises WHERE nombre_pais = 'Pais migracion sesion'");
+            connection.commit();
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "UPDATE operaciones_cambio_usuario SET jwt_original_expira_en = SYSTIMESTAMP "
+                    + "WHERE clave = 'legacy-pendiente'")).getErrorCode());
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "INSERT INTO operaciones_cambio_usuario (clave, estado, sesion_original) "
+                    + "VALUES ('incompleta', 'PENDIENTE', 'sesion')")).getErrorCode());
             try (ResultSet result = statement.executeQuery(
                     "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME IN "
                     + "('PAISES', 'REGIONES', 'COMUNAS', 'EMPRESAS', 'ROLES', "
@@ -83,12 +211,14 @@ class UsuariosOracleMigrationTest {
                     + "SELECT p.id_pais, t.id_tipo_documento, 'TEST-1', 'Persona de prueba', '123', 'prueba@example.invalid' "
                     + "FROM paises p CROSS JOIN tipos_documento t");
             statement.executeUpdate("INSERT INTO usuarios (persona_id, rol_id, password) "
-                    + "SELECT p.id_persona, r.id_rol, 'test-only' FROM personas p CROSS JOIN roles r");
+                    + "SELECT p.id_persona, r.id_rol, '"
+                    + new BCryptPasswordEncoder().encode("password")
+                    + "' FROM personas p CROSS JOIN roles r");
             statement.executeUpdate("INSERT INTO pasajeros (persona_id, empresa_id) "
                     + "SELECT p.id_persona, e.id_empresa FROM personas p CROSS JOIN empresas e");
             statement.executeUpdate("INSERT INTO sesiones_usuario "
-                    + "(sesion_id, usuario_id, fecha_inicio, fecha_expiracion, activa) "
-                    + "SELECT 'test-session', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, 1 "
+                    + "(sesion_id, usuario_id, fecha_inicio, fecha_expiracion, fecha_expiracion_instante, activa) "
+                    + "SELECT 'test-session', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, SYSTIMESTAMP + 1, 1 "
                     + "FROM usuarios");
 
             assertEquals(1, assertThrows(SQLException.class, () -> statement.executeUpdate(
@@ -101,6 +231,137 @@ class UsuariosOracleMigrationTest {
                     "INSERT INTO pasajeros (persona_id, empresa_id) SELECT id_persona, NULL FROM personas")).getErrorCode());
             connection.commit();
             assertTrue(context.getBean(PersonaRepository.class).existsByEmail("prueba@example.invalid"));
+            Long usuarioId;
+            try (ResultSet result = statement.executeQuery("SELECT id_usuario FROM usuarios")) {
+                assertTrue(result.next());
+                usuarioId = result.getLong(1);
+            }
+            UsuarioService usuarios = context.getBean(UsuarioService.class);
+            statement.executeUpdate("INSERT INTO roles (nombre_rol) VALUES ('ADMINISTRADOR')");
+            statement.executeUpdate("UPDATE usuarios SET rol_id = (SELECT id_rol FROM roles WHERE nombre_rol = 'ADMINISTRADOR')");
+            statement.executeUpdate("INSERT INTO sesiones_usuario "
+                    + "(sesion_id, usuario_id, fecha_inicio, fecha_expiracion, fecha_expiracion_instante, activa) "
+                    + "SELECT 'decision-session', id_usuario, SYSTIMESTAMP, SYSTIMESTAMP + 1, SYSTIMESTAMP + 1, 1 FROM usuarios");
+            connection.commit();
+            var decision = context.getBean(DecisionAutorizacionService.class);
+            assertEquals(503, assertThrows(ResponseStatusException.class, () -> decision.decidir(new DecisionAutorizacionService.Solicitud(
+                    "VEHICULOS_ESTADO", "antigua", 1L, "sesion-antigua", "a".repeat(64),
+                    java.time.OffsetDateTime.parse("2030-01-02T03:04:05Z")))).getStatusCode().value());
+            var solicitud = new DecisionAutorizacionService.Solicitud(
+                    "VEHICULOS_ESTADO", "oracle-decision", usuarioId, "decision-session", "a".repeat(64),
+                    java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).withNano(0).plusMinutes(5));
+            assertEquals(503, assertThrows(ResponseStatusException.class, () -> decision.decidir(solicitud))
+                    .getStatusCode().value());
+            usuarios.cerrarSesion("decision-session");
+            assertEquals(503, assertThrows(ResponseStatusException.class, () -> decision.decidir(solicitud))
+                    .getStatusCode().value());
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM decisiones_autorizacion WHERE decision_id = 'VEHICULOS_ESTADO:oracle-decision'")) {
+                assertTrue(result.next());
+                assertEquals(0, result.getInt(1));
+            }
+            var inicio = usuarios.iniciarSesion("prueba@example.invalid", "password");
+            assertEquals("Bearer", inicio.get("tokenType"));
+            String sesionLogin = context.getBean(JwtService.class)
+                    .parseToken((String) inicio.get("accessToken")).get("sessionId", String.class);
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT fecha_expiracion_instante FROM sesiones_usuario WHERE sesion_id = '" + sesionLogin + "'")) {
+                assertTrue(result.next());
+                assertTrue(result.getObject(1, java.time.OffsetDateTime.class).toInstant().isAfter(java.time.Instant.now()));
+                assertEquals(context.getBean(JwtService.class).parseToken((String) inicio.get("accessToken"))
+                                .getExpiration().toInstant(),
+                        result.getObject(1, java.time.OffsetDateTime.class).toInstant());
+            }
+            CambioUsuarioTransacciones cambios = context.getBean(CambioUsuarioTransacciones.class);
+            String barrera = java.util.UUID.randomUUID().toString();
+            cambios.reservar("oracle-estado", usuarioId, "test-session", usuarioId, "hash", barrera, false, null,
+                    java.time.OffsetDateTime.parse("2030-01-02T03:04:05Z"));
+            assertEquals("PENDIENTE", cambios.leer("oracle-estado", usuarioId, usuarioId, "hash").estado());
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT sesion_original, tipo_solicitud, solicitud_activo, jwt_original_expira_en FROM operaciones_cambio_usuario "
+                    + "WHERE clave = 'oracle-estado'")) {
+                assertTrue(result.next());
+                assertEquals("test-session", result.getString(1));
+                assertEquals("ESTADO", result.getString(2));
+                assertEquals(0, result.getInt(3));
+                assertEquals(java.time.Instant.parse("2030-01-02T03:04:05Z"),
+                        result.getObject(4, java.time.OffsetDateTime.class).toInstant());
+            }
+            UsuarioRepository repository = context.getBean(UsuarioRepository.class);
+            TransactionTemplate tx = new TransactionTemplate(context.getBean(PlatformTransactionManager.class));
+            CountDownLatch logoutStarted = new CountDownLatch(1);
+            AtomicReference<Future<?>> logout = new AtomicReference<>();
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                tx.executeWithoutResult(status -> {
+                    repository.findForUpdate(usuarioId).orElseThrow();
+                    logout.set(executor.submit(() -> {
+                        logoutStarted.countDown();
+                        usuarios.cerrarSesion(sesionLogin);
+                    }));
+                    try {
+                        assertTrue(logoutStarted.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(exception);
+                    }
+                    assertThrows(TimeoutException.class, () -> logout.get().get(500, TimeUnit.MILLISECONDS));
+                });
+                logout.get().get(10, TimeUnit.SECONDS);
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM sesiones_usuario WHERE activa = 1")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            CountDownLatch started = new CountDownLatch(1);
+            AtomicReference<Future<?>> login = new AtomicReference<>();
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                tx.executeWithoutResult(status -> {
+                    repository.findForUpdate(usuarioId).orElseThrow();
+                    login.set(executor.submit(() -> {
+                        started.countDown();
+                        return usuarios.iniciarSesion("prueba@example.invalid", "password");
+                    }));
+                    try {
+                        assertTrue(started.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(exception);
+                    }
+                    assertThrows(TimeoutException.class, () -> login.get().get(500, TimeUnit.MILLISECONDS));
+                    assertEquals("APLICADA",
+                            cambios.aplicar("oracle-estado", usuarioId, usuarioId, "hash", false, null).estado());
+                });
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> login.get().get(10, TimeUnit.SECONDS));
+                assertEquals(401, ((ResponseStatusException) failure.getCause()).getStatusCode().value());
+            }
+            assertEquals(1, cambios.aplicadas(null).size());
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT COUNT(*) FROM operaciones_cambio_usuario WHERE clave = 'oracle-estado' "
+                    + "AND sesion_original IS NULL AND tipo_solicitud IS NULL AND solicitud_activo IS NULL "
+                    + "AND jwt_original_expira_en IS NULL")) {
+                assertTrue(result.next());
+                assertEquals(1, result.getInt(1));
+            }
+            assertEquals(200, cambios.finalizar("oracle-estado", usuarioId, usuarioId, "hash").codigo());
+            cambios.reservar("oracle-rol-inexistente", usuarioId, "test-session", usuarioId, "otro-hash",
+                    java.util.UUID.randomUUID().toString(), null, 999999999L, null);
+            assertEquals(404, cambios.leer("oracle-rol-inexistente", usuarioId, usuarioId, "otro-hash")
+                    .resultado().codigo());
+            statement.executeUpdate("UPDATE operaciones_cambio_usuario SET expira_en = SYSTIMESTAMP - INTERVAL '1' DAY "
+                    + "WHERE clave = 'oracle-estado'");
+            connection.commit();
+            cambios.limpiarRespuestasExpiradas();
+            assertEquals("EXPIRADA", cambios.leer("oracle-estado", usuarioId, usuarioId, "hash").estado());
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT activo, (SELECT COUNT(*) FROM sesiones_usuario WHERE activa = 1) FROM usuarios")) {
+                assertTrue(result.next());
+                assertEquals(0, result.getInt(1));
+                assertEquals(0, result.getInt(2));
+            }
+            assertEquals(401, assertThrows(ResponseStatusException.class,
+                    () -> usuarios.iniciarSesion("prueba@example.invalid", "password")).getStatusCode().value());
         }
     }
 }

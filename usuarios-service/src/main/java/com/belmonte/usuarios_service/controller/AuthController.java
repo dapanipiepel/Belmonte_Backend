@@ -1,10 +1,14 @@
 package com.belmonte.usuarios_service.controller;
 
-import com.belmonte.usuarios_service.model.SesionUsuario;
-import com.belmonte.usuarios_service.model.Usuario;
 import com.belmonte.usuarios_service.repository.SesionUsuarioRepository;
 import com.belmonte.usuarios_service.service.JwtService;
 import com.belmonte.usuarios_service.service.UsuarioService;
+import com.belmonte.usuarios_service.service.RelojBaseDatos;
+import com.belmonte.usuarios_service.security.InternalApiAuthentication;
+import io.jsonwebtoken.JwtException;
+import org.springframework.dao.DataAccessException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -13,33 +17,33 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.time.LocalDateTime;
-import java.util.List;
 import java.util.Map;
-import java.util.UUID;
-import org.springframework.beans.factory.annotation.Value;
+import java.time.Instant;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import org.springframework.web.bind.annotation.RequestParam;
 
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
     private final UsuarioService usuarioService;
     private final SesionUsuarioRepository sesionRepository;
     private final JwtService jwtService;
-    private final String internalApiSecret;
+    private final InternalApiAuthentication internalApiAuthentication;
+    private final RelojBaseDatos reloj;
 
     public AuthController(UsuarioService usuarioService,
                           SesionUsuarioRepository sesionRepository,
                           JwtService jwtService,
-                          @Value("${internal.api.secret}") String internalApiSecret) {
+                          InternalApiAuthentication internalApiAuthentication,
+                          RelojBaseDatos reloj) {
         this.usuarioService = usuarioService;
         this.sesionRepository = sesionRepository;
         this.jwtService = jwtService;
-        this.internalApiSecret = internalApiSecret;
+        this.internalApiAuthentication = internalApiAuthentication;
+        this.reloj = reloj;
     }
 
     @PostMapping("/login")
@@ -53,54 +57,31 @@ public class AuthController {
                     "Debe ingresar correo y contrasena");
         }
 
-        Usuario usuario = usuarioService.iniciarSesion(email, password);
-        LocalDateTime started = LocalDateTime.now();
-        LocalDateTime expires = started.plusNanos(jwtService.getExpirationMillis() * 1_000_000);
-
-        SesionUsuario session = new SesionUsuario();
-        session.setSesionId(UUID.randomUUID().toString());
-        session.setUsuario(usuario);
-        session.setFechaInicio(started);
-        session.setFechaExpiracion(expires);
-        session.setActiva(1);
-        sesionRepository.save(session);
-
-        String token = jwtService.createToken(
-                usuario.getPersona().getEmail(),
-                usuario.getIdUsuario(),
-                session.getSesionId(),
-                List.of(usuario.getRol().getNombreRol()));
-
-        return Map.of(
-                "accessToken", token,
-                "tokenType", "Bearer",
-                "expiresIn", jwtService.getExpirationMillis() / 1000,
-                "usuario", Map.of(
-                        "idUsuario", usuario.getIdUsuario(),
-                        "idPersona", usuario.getPersona().getIdPersona(),
-                        "nombreCompleto", usuario.getPersona().getNombreCompleto(),
-                        "email", usuario.getPersona().getEmail(),
-                        "rol", usuario.getRol().getNombreRol(),
-                        "activo", usuario.getActivo()));
+        return usuarioService.iniciarSesion(email, password);
     }
 
     @GetMapping("/sessions/{sessionId}/validate")
     public Map<String, Object> validateSession(
             @PathVariable String sessionId,
             @RequestHeader(value = "X-Belmonte-Internal-Secret", required = false)
-            String suppliedSecret) {
-        boolean secretMatches = suppliedSecret != null
-                && MessageDigest.isEqual(
-                        suppliedSecret.getBytes(StandardCharsets.UTF_8),
-                        internalApiSecret.getBytes(StandardCharsets.UTF_8));
-        if (!secretMatches) {
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Credencial interna invalida");
-        }
+            String suppliedSecret,
+            @RequestParam(value = "jwtExpiraEn", required = false) Long jwtExpiraEn) {
+        internalApiAuthentication.requireValidSecret(suppliedSecret);
 
-        boolean active = sesionRepository
-                .findBySesionIdAndActiva(sessionId, 1)
-                .filter(session -> session.getFechaExpiracion().isAfter(LocalDateTime.now()))
-                .isPresent();
+        boolean active;
+        try {
+            active = sesionRepository
+                    .findBySesionIdAndActiva(sessionId, 1)
+                    .filter(session -> {
+                        Instant ahora = reloj.ahora().toInstant();
+                        return session.vigenteEn(ahora)
+                                && (jwtExpiraEn == null || Instant.ofEpochMilli(jwtExpiraEn).isAfter(ahora));
+                    })
+                    .isPresent();
+        } catch (DataAccessException exception) {
+            log.warn("No se pudo consultar la sesion o el reloj de base de datos", exception);
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Validacion de sesion no disponible", exception);
+        }
 
         if (!active) {
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Sesion revocada o vencida");
@@ -115,16 +96,19 @@ public class AuthController {
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Token requerido");
         }
 
+        String sessionId;
         try {
-            String sessionId = jwtService.parseToken(
-                    authorization.substring(7)).get("sessionId", String.class);
-            sesionRepository.findById(sessionId).ifPresent(session -> {
-                session.setActiva(0);
-                sesionRepository.save(session);
-            });
-        } catch (RuntimeException exception) {
+            sessionId = jwtService.parseToken(authorization.substring(7), reloj.ahora().toInstant()).get("sessionId", String.class);
+        } catch (DataAccessException exception) {
+            log.warn("No se pudo consultar el reloj de base de datos", exception);
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Validacion de sesion no disponible", exception);
+        } catch (JwtException | IllegalArgumentException exception) {
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Token invalido");
         }
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Token invalido");
+        }
+        usuarioService.cerrarSesion(sessionId);
 
         return Map.of("mensaje", "Sesion cerrada");
     }

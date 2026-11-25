@@ -36,7 +36,10 @@ public class JwtService {
     }
 
     public String createToken(String subject, Long usuarioId, String sessionId, List<String> roles) {
-        Instant now = Instant.now();
+        return createToken(subject, usuarioId, sessionId, roles, Instant.now());
+    }
+
+    public String createToken(String subject, Long usuarioId, String sessionId, List<String> roles, Instant now) {
         Instant expires = now.plusMillis(expirationMillis);
 
         return Jwts.builder()
@@ -55,8 +58,13 @@ public class JwtService {
     }
 
     public Claims parseToken(String token) {
+        return parseToken(token, Instant.now());
+    }
+
+    public Claims parseToken(String token, Instant now) {
         return Jwts.parser()
                 .verifyWith(key)
+                .clock(() -> Date.from(now))
                 .build()
                 .parseSignedClaims(token)
                 .getPayload();

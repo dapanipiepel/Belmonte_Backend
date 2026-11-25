@@ -1,5 +1,6 @@
 package com.belmonte.usuarios_service.security;
 
+import jakarta.servlet.DispatcherType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -36,9 +37,11 @@ public class SecurityConfig {
                             response.getWriter().write("{\"error\":\"Acceso denegado\"}");
                         }))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/logout").authenticated()
                         .requestMatchers(HttpMethod.GET, "/api/auth/sessions/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/internal/conductores/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/usuarios/**")
                             .hasRole("ADMINISTRADOR")
                         .requestMatchers(HttpMethod.GET, "/api/usuarios/**")

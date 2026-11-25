@@ -27,6 +27,7 @@ services:
       USUARIOS_DB_PASSWORD: ${USUARIOS_DB_PASSWORD:?Configure USUARIOS_DB_PASSWORD en .env}
       JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
+      VIAJES_SERVICE_URI: http://viajes-service:8083
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:
@@ -45,6 +46,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
       USUARIOS_SERVICE_URI: http://usuarios-service:8081
+      VIAJES_SERVICE_URI: http://viajes-service:8083
     ports:
       - "127.0.0.1:8082:8082"
     depends_on:
@@ -63,6 +65,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
       USUARIOS_SERVICE_URI: http://usuarios-service:8081
+      VEHICULOS_SERVICE_URI: http://vehiculos-service:8082
     ports:
       - "127.0.0.1:8083:8083"
     depends_on:

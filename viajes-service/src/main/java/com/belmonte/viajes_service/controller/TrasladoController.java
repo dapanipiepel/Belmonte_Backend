@@ -6,12 +6,16 @@ import com.belmonte.viajes_service.dto.EstadoRequest;
 import com.belmonte.viajes_service.dto.TrasladoRequest;
 import com.belmonte.viajes_service.dto.TrasladoResponse;
 import com.belmonte.viajes_service.service.TrasladoService;
+import com.belmonte.viajes_service.service.AsignacionIdempotenteService;
+import com.belmonte.viajes_service.service.AsignacionOperacionTransacciones;
+import com.belmonte.viajes_service.security.IdentidadSesion;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
@@ -24,6 +28,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -37,11 +42,14 @@ import java.util.List;
 public class TrasladoController {
 
     private final TrasladoService trasladoService;
+    private final AsignacionIdempotenteService asignaciones;
     private final SecretKey key;
 
     public TrasladoController(TrasladoService trasladoService,
+                              AsignacionIdempotenteService asignaciones,
                               @Value("${jwt.secret}") String secret) {
         this.trasladoService = trasladoService;
+        this.asignaciones = asignaciones;
         try {
             byte[] keyBytes = MessageDigest.getInstance("SHA-256")
                     .digest(secret.getBytes(StandardCharsets.UTF_8));
@@ -118,7 +126,7 @@ public class TrasladoController {
     }
 
     @PutMapping("/{id}/asignar")
-    public TrasladoResponse asignar(
+    public ResponseEntity<String> asignar(
             @PathVariable Long id,
             @Valid @RequestBody AsignacionRequest request,
             @RequestHeader(value = "Authorization", required = false) String authorization,
@@ -129,10 +137,25 @@ public class TrasladoController {
                     "Solo administradores pueden asignar");
         }
         Long usuarioId = usuarioId(authorization);
-        var traslado = trasladoService.asignar(
-                id, request, usuarioId, idempotencyKey);
-        return TrasladoResponse.from(
-                traslado, trasladoService.estadoActual(traslado));
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !(authentication.getDetails() instanceof IdentidadSesion identidad)
+                || identidad.sesionId() == null || identidad.sesionId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Sesion invalida");
+        }
+        var resultado = asignaciones.asignar(idempotencyKey, usuarioId, identidad.sesionId(), id, request,
+                identidad.jwtExpiraEn());
+        return ResponseEntity.status(resultado.codigo()).contentType(MediaType.APPLICATION_JSON)
+                .body(resultado.cuerpo());
+    }
+
+    @GetMapping("/operaciones/asignacion")
+    public AsignacionOperacionTransacciones.Consulta consultarAsignacion(
+            @RequestParam("clave") String clave,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        if (!hasRole("ADMINISTRADOR")) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Solo administradores pueden consultar");
+        }
+        return asignaciones.consultar(clave, usuarioId(authorization));
     }
 
     @PatchMapping("/{id}/estado")
@@ -160,20 +183,8 @@ public class TrasladoController {
             @RequestHeader(value = "Authorization", required = false) String authorization,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         Long usuarioId = usuarioId(authorization);
-        var traslado = trasladoService.buscar(id)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND, "Traslado no encontrado"));
-        boolean autorizado = hasRole("ADMINISTRADOR")
-                || traslado.getSolicitanteId().equals(usuarioId)
-                || (hasRole("CONDUCTOR")
-                        && usuarioId.equals(traslado.getConductorId()));
-        if (!autorizado) {
-            throw new ResponseStatusException(
-                    HttpStatus.FORBIDDEN,
-                    "Sin permiso para cancelar el traslado");
-        }
         var cancelado = trasladoService.cancelar(
-                id, request, usuarioId, idempotencyKey);
+                id, request, usuarioId, hasRole("ADMINISTRADOR"), hasRole("CONDUCTOR"), idempotencyKey);
         return TrasladoResponse.from(
                 cancelado, trasladoService.estadoActual(cancelado));
     }

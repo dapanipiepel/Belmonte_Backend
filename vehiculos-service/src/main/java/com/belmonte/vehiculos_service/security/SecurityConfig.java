@@ -1,5 +1,6 @@
 package com.belmonte.vehiculos_service.security;
 
+import jakarta.servlet.DispatcherType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -36,6 +37,10 @@ public class SecurityConfig {
                             response.getWriter().write("{\"error\":\"Acceso denegado\"}");
                         }))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
+                        .requestMatchers(HttpMethod.GET, "/internal/vehiculos/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/vehiculos/operaciones/estado")
+                            .hasRole("ADMINISTRADOR")
                         .requestMatchers(HttpMethod.GET, "/api/vehiculos/**").authenticated()
                         .requestMatchers(HttpMethod.POST, "/api/vehiculos/**")
                             .hasRole("ADMINISTRADOR")

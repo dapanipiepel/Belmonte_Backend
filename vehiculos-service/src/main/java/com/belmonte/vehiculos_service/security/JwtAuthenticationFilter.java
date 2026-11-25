@@ -1,6 +1,7 @@
 package com.belmonte.vehiculos_service.security;
 
 import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import jakarta.servlet.FilterChain;
@@ -8,6 +9,8 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -18,17 +21,20 @@ import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.ZoneOffset;
 import java.net.URLEncoder;
 import java.util.List;
 
 @Component
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
+    private static final Logger log = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
     private final SecretKey key;
     private final String usuariosServiceUri;
     private final String internalApiSecret;
@@ -47,28 +53,26 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             this.httpClient = HttpClient.newBuilder()
                     .connectTimeout(Duration.ofSeconds(3))
                     .build();
-        } catch (Exception exception) {
+        } catch (NoSuchAlgorithmException exception) {
             throw new IllegalStateException("No se pudo configurar JWT", exception);
         }
     }
 
-    private boolean sessionIsActive(String sessionId) {
-        if (sessionId == null) {
-            return false;
-        }
-        try {
-            HttpRequest request = HttpRequest.newBuilder(
-                            URI.create(usuariosServiceUri + "/api/auth/sessions/"
-                                    + URLEncoder.encode(sessionId, StandardCharsets.UTF_8)
-                                    + "/validate"))
-                    .timeout(Duration.ofSeconds(3))
-                    .header("X-Belmonte-Internal-Secret", internalApiSecret)
-                    .GET()
-                    .build();
-            return httpClient.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
-        } catch (Exception exception) {
-            return false;
-        }
+    private boolean sessionIsActive(String sessionId, java.util.Date jwtExpiration) throws IOException, InterruptedException {
+        String expirationQuery = jwtExpiration == null ? "" : "?jwtExpiraEn=" + jwtExpiration.getTime();
+        HttpRequest request = HttpRequest.newBuilder(
+                        URI.create(usuariosServiceUri + "/api/auth/sessions/"
+                                + URLEncoder.encode(sessionId, StandardCharsets.UTF_8)
+                                + "/validate" + expirationQuery))
+                .timeout(Duration.ofSeconds(3))
+                .header("X-Belmonte-Internal-Secret", internalApiSecret)
+                .GET()
+                .build();
+        int status = httpClient.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+        if (status == 200) return true;
+        if (status == 401) return false;
+        log.warn("La validacion interna de sesion respondio HTTP {}", status);
+        throw new IOException("La validacion interna de sesion respondio HTTP " + status);
     }
 
     @Override
@@ -79,29 +83,57 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         String authorization = request.getHeader("Authorization");
 
         if (authorization != null && authorization.startsWith("Bearer ")) {
+            Claims claims;
             try {
-                Claims claims = Jwts.parser()
+                claims = Jwts.parser()
                         .verifyWith(key)
                         .build()
                         .parseSignedClaims(authorization.substring(7))
                         .getPayload();
-                @SuppressWarnings("unchecked")
-                List<String> roles = claims.get("roles", List.class);
-                String sessionId = claims.get("sessionId", String.class);
-                if (!sessionIsActive(sessionId)) {
-                    SecurityContextHolder.clearContext();
-                    filterChain.doFilter(request, response);
-                    return;
-                }
-                var authorities = roles.stream()
-                        .map(role -> new SimpleGrantedAuthority("ROLE_" + role))
-                        .toList();
-                SecurityContextHolder.getContext().setAuthentication(
-                        new UsernamePasswordAuthenticationToken(
-                                claims.getSubject(), null, authorities));
-            } catch (RuntimeException exception) {
+            } catch (JwtException | IllegalArgumentException exception) {
                 SecurityContextHolder.clearContext();
+                filterChain.doFilter(request, response);
+                return;
             }
+            Object rolesClaim = claims.get("roles");
+            Object sessionClaim = claims.get("sessionId");
+            if (!(rolesClaim instanceof List<?> rolesList) || !(sessionClaim instanceof String sessionId)) {
+                SecurityContextHolder.clearContext();
+                filterChain.doFilter(request, response);
+                return;
+            }
+            List<String> roles = rolesList.stream()
+                    .filter(String.class::isInstance)
+                    .map(String.class::cast)
+                    .toList();
+            boolean active;
+            try {
+                active = sessionIsActive(sessionId, claims.getExpiration());
+            } catch (IOException exception) {
+                log.warn("No se pudo validar la sesion con usuarios: {}", exception.getClass().getSimpleName());
+                response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+                return;
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                log.warn("Se interrumpio la validacion de la sesion con usuarios");
+                response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+                return;
+            }
+            if (!active) {
+                SecurityContextHolder.clearContext();
+                filterChain.doFilter(request, response);
+                return;
+            }
+            var authorities = roles.stream()
+                    .map(role -> new SimpleGrantedAuthority("ROLE_" + role))
+                    .toList();
+            var authentication = new UsernamePasswordAuthenticationToken(claims.getSubject(), null, authorities);
+            Object usuarioId = claims.get("usuarioId");
+            var vencimiento = claims.getExpiration() == null ? null
+                    : claims.getExpiration().toInstant().atOffset(ZoneOffset.UTC);
+            if (usuarioId instanceof Integer id) authentication.setDetails(new IdentidadSesion(id.longValue(), sessionId, vencimiento));
+            else if (usuarioId instanceof Long id) authentication.setDetails(new IdentidadSesion(id, sessionId, vencimiento));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
         }
 
         filterChain.doFilter(request, response);

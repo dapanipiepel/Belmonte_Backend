@@ -12,6 +12,13 @@ import java.util.Optional;
 public interface SesionUsuarioRepository extends JpaRepository<SesionUsuario, String> {
     Optional<SesionUsuario> findBySesionIdAndActiva(String sesionId, Integer activa);
 
+    @Query("select s.usuario.idUsuario from SesionUsuario s where s.sesionId = :sesionId")
+    Optional<Long> findUsuarioIdBySesionId(@Param("sesionId") String sesionId);
+
+    @Modifying
+    @Query("UPDATE SesionUsuario s SET s.activa = 0 WHERE s.sesionId = :sesionId AND s.usuario.idUsuario = :usuarioId")
+    int revokeBySesionIdAndUsuarioId(@Param("sesionId") String sesionId, @Param("usuarioId") Long usuarioId);
+
     @Modifying
     @Transactional
     @Query("UPDATE SesionUsuario s SET s.activa = 0 WHERE s.usuario.idUsuario = :usuarioId AND s.activa = 1")

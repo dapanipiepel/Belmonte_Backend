@@ -4,10 +4,17 @@ import com.belmonte.vehiculos_service.dto.VehiculoRequest;
 import com.belmonte.vehiculos_service.dto.VehiculoResponse;
 import com.belmonte.vehiculos_service.dto.VehiculoEstadoRequest;
 import com.belmonte.vehiculos_service.service.VehiculoService;
+import com.belmonte.vehiculos_service.service.EstadoVehiculoIdempotenteService;
+import com.belmonte.vehiculos_service.service.EstadoVehiculoTransacciones;
+import com.belmonte.vehiculos_service.security.IdentidadSesion;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.List;
 
@@ -17,9 +24,11 @@ import java.util.List;
 public class VehiculoController {
 
     private final VehiculoService vehiculoService;
+    private final EstadoVehiculoIdempotenteService estados;
 
-    public VehiculoController(VehiculoService vehiculoService) {
+    public VehiculoController(VehiculoService vehiculoService, EstadoVehiculoIdempotenteService estados) {
         this.vehiculoService = vehiculoService;
+        this.estados = estados;
     }
 
     @GetMapping
@@ -44,11 +53,28 @@ public class VehiculoController {
     }
 
     @PatchMapping("/{id}/estado")
-    public ResponseEntity<VehiculoResponse> cambiarEstado(
+    public ResponseEntity<String> cambiarEstado(
             @PathVariable Long id,
-            @Valid @RequestBody VehiculoEstadoRequest request) {
-        return ResponseEntity.ok(VehiculoResponse.from(
-                vehiculoService.cambiarEstado(id, request.activo())));
+            @Valid @RequestBody VehiculoEstadoRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String clave) {
+        var actor = identidad();
+        var resultado = estados.cambiar(clave, actor.usuarioId(), actor.sesionId(), id, request.activo(), actor.jwtExpiraEn());
+        return ResponseEntity.status(resultado.codigo()).contentType(MediaType.APPLICATION_JSON).body(resultado.cuerpo());
+    }
+
+    @GetMapping("/operaciones/estado")
+    public EstadoVehiculoTransacciones.Consulta consultarOperacion(@RequestParam String clave) {
+        return estados.consultar(clave, identidad().usuarioId());
+    }
+
+    private IdentidadSesion identidad() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !(authentication.getDetails() instanceof IdentidadSesion identidad)
+                || identidad.usuarioId() == null || identidad.usuarioId() <= 0
+                || identidad.sesionId() == null || identidad.sesionId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Identidad de usuario invalida");
+        }
+        return identidad;
     }
 
 }

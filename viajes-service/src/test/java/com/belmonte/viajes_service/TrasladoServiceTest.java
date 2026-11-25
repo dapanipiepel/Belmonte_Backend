@@ -8,14 +8,15 @@ import com.belmonte.viajes_service.dto.UbicacionRequest;
 import com.belmonte.viajes_service.model.EstadoTraslado;
 import com.belmonte.viajes_service.model.Traslado;
 import com.belmonte.viajes_service.repository.EstadoTrasladoRepository;
+import com.belmonte.viajes_service.repository.BarreraRecursoRepository;
 import com.belmonte.viajes_service.repository.HistorialEstadoRepository;
 import com.belmonte.viajes_service.repository.OperacionTrasladoRepository;
-import com.belmonte.viajes_service.repository.RecursoTrasladoRepository;
 import com.belmonte.viajes_service.repository.TrasladoRepository;
 import com.belmonte.viajes_service.repository.UbicacionRepository;
 import com.belmonte.viajes_service.service.TrasladoService;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.OffsetDateTime;
 import java.util.Set;
@@ -34,12 +35,10 @@ class TrasladoServiceTest {
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
         OperacionTrasladoRepository operaciones =
                 mock(OperacionTrasladoRepository.class);
-        RecursoTrasladoRepository recursos =
-                mock(RecursoTrasladoRepository.class);
 
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, recursos);
+                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(1L, "Origen", null, null),
@@ -63,12 +62,10 @@ class TrasladoServiceTest {
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
         OperacionTrasladoRepository operaciones =
                 mock(OperacionTrasladoRepository.class);
-        RecursoTrasladoRepository recursos =
-                mock(RecursoTrasladoRepository.class);
 
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, recursos);
+                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(
@@ -95,8 +92,6 @@ class TrasladoServiceTest {
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
         OperacionTrasladoRepository operaciones =
                 mock(OperacionTrasladoRepository.class);
-        RecursoTrasladoRepository recursos =
-                mock(RecursoTrasladoRepository.class);
 
         when(ubicaciones.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(traslados.saveAndFlush(any())).thenAnswer(invocation -> {
@@ -112,7 +107,7 @@ class TrasladoServiceTest {
 
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, recursos);
+                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(1L, "Origen", null, null),
