@@ -27,6 +27,10 @@ import java.util.concurrent.Future;
 
 import com.belmonte.usuarios_service.repository.PersonaRepository;
 import com.belmonte.usuarios_service.repository.UsuarioRepository;
+import com.belmonte.usuarios_service.repository.InvitacionRepository;
+import com.belmonte.usuarios_service.repository.RecuperacionPasswordRepository;
+import com.belmonte.usuarios_service.model.Invitacion;
+import com.belmonte.usuarios_service.model.RecuperacionPassword;
 import com.belmonte.usuarios_service.service.CambioUsuarioTransacciones;
 import com.belmonte.usuarios_service.service.ComunaService;
 import com.belmonte.usuarios_service.service.EmpresaService;
@@ -38,6 +42,7 @@ import com.belmonte.usuarios_service.security.IdentidadSesion;
 import com.belmonte.usuarios_service.service.JwtService;
 import com.belmonte.usuarios_service.service.DecisionAutorizacionService;
 import com.belmonte.usuarios_service.service.RelojBaseDatos;
+import com.belmonte.usuarios_service.service.RecuperacionPasswordService;
 import com.belmonte.usuarios_service.service.UsuarioService;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
@@ -155,8 +160,126 @@ class UsuariosOracleMigrationTest {
             assertTrue(comunas.get(0).idPais() > 0);
             verificarComunasHttp(context, comunas.get(0));
             verifyConstraintsAndRepository(url, username, password, context);
+            verificarInvitacionesYRecuperaciones(context);
             verificarEmpresas(context);
             verificarPasajeros(context);
+            verificarServicioRecuperacion(context);
+        }
+    }
+
+    private void verificarServicioRecuperacion(ConfigurableApplicationContext context) throws Exception {
+        var jdbc = context.getBean(JdbcTemplate.class);
+        var recuperaciones = context.getBean(RecuperacionPasswordService.class);
+        long id = jdbc.queryForObject("SELECT u.id_usuario FROM usuarios u JOIN personas p "
+                + "ON p.id_persona = u.persona_id WHERE p.email = 'usuario-pasajeros@example.invalid'", Long.class);
+        var anterior = recuperaciones.emitir(id);
+        var actual = recuperaciones.emitir(id);
+        assertThrows(ResponseStatusException.class, () -> recuperaciones.cambiarPassword(anterior.token(), "nuevo"));
+        var inicio = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var tareas = new java.util.ArrayList<Future<Integer>>();
+            for (int i = 0; i < 2; i++) {
+                tareas.add(executor.submit(() -> {
+                    inicio.await();
+                    try {
+                        recuperaciones.cambiarPassword(actual.token(), "nuevo");
+                        return 200;
+                    } catch (ResponseStatusException exception) {
+                        return exception.getStatusCode().value();
+                    }
+                }));
+            }
+            inicio.countDown();
+            assertEquals(List.of(200, 400), java.util.stream.Stream.of(
+                    tareas.get(0).get(20, TimeUnit.SECONDS), tareas.get(1).get(20, TimeUnit.SECONDS))
+                    .sorted().toList());
+        }
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM sesiones_usuario WHERE usuario_id = ? AND activa = 1",
+                Integer.class, id));
+        String hash = jdbc.queryForObject("SELECT password FROM usuarios WHERE id_usuario = ?", String.class, id);
+        assertTrue(new BCryptPasswordEncoder().matches("nuevo", hash));
+    }
+
+    private void verificarInvitacionesYRecuperaciones(ConfigurableApplicationContext context) throws Exception {
+        var jdbc = context.getBean(JdbcTemplate.class);
+        var tx = new TransactionTemplate(context.getBean(PlatformTransactionManager.class));
+        var invitaciones = context.getBean(InvitacionRepository.class);
+        var recuperaciones = context.getBean(RecuperacionPasswordRepository.class);
+        var usuarios = context.getBean(UsuarioRepository.class);
+        Long usuarioId = jdbc.queryForObject("SELECT u.id_usuario FROM usuarios u JOIN personas p "
+                + "ON p.id_persona = u.persona_id WHERE p.email = 'prueba@example.invalid'", Long.class);
+        var ahora = java.time.OffsetDateTime.parse("2030-01-01T00:00:00Z");
+        tx.executeWithoutResult(status -> {
+            var usuario = usuarios.findById(usuarioId).orElseThrow();
+            var invitacion = new Invitacion();
+            invitacion.setEmailDestinatario("invitado@example.invalid");
+            invitacion.setRol(usuario.getRol());
+            invitacion.setCreadoPorUsuario(usuario);
+            invitacion.setTokenHash("a".repeat(64));
+            invitacion.setFechaCreacion(ahora);
+            invitacion.setFechaExpiracion(ahora.plusHours(48));
+            invitaciones.saveAndFlush(invitacion);
+            var recuperacion = new RecuperacionPassword();
+            recuperacion.setUsuario(usuario);
+            recuperacion.setTokenHash("b".repeat(64));
+            recuperacion.setFechaCreacion(ahora);
+            recuperacion.setFechaExpiracion(ahora.plusHours(1));
+            recuperaciones.saveAndFlush(recuperacion);
+        });
+        verificarBloqueo(tx, () -> {
+            var invitacion = invitaciones.findByTokenHash("a".repeat(64)).orElseThrow();
+            assertTrue(!invitacion.isUsada());
+            invitacion.setUsada(true);
+            invitacion.setFechaUso(ahora.plusMinutes(1));
+        }, () -> invitaciones.findByTokenHash("a".repeat(64)).orElseThrow().isUsada());
+        verificarBloqueo(tx, () -> {
+            var recuperacion = recuperaciones.findByTokenHash("b".repeat(64)).orElseThrow();
+            assertTrue(!recuperacion.isUsada());
+            recuperacion.setUsada(true);
+            recuperacion.setFechaUso(ahora.plusMinutes(1));
+        }, () -> recuperaciones.findByTokenHash("b".repeat(64)).orElseThrow().isUsada());
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM invitaciones WHERE token_hash = ? "
+                + "AND usada = 1 AND fecha_uso IS NOT NULL", Integer.class, "a".repeat(64)));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM recuperaciones_password WHERE token_hash = ? "
+                + "AND usada = 1 AND fecha_uso IS NOT NULL", Integer.class, "b".repeat(64)));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update(
+                "UPDATE invitaciones SET usada = 2 WHERE token_hash = ?", "a".repeat(64)));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update(
+                "UPDATE recuperaciones_password SET fecha_uso = NULL WHERE token_hash = ?", "b".repeat(64)));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update(
+                "UPDATE invitaciones SET fecha_expiracion = fecha_creacion WHERE token_hash = ?", "a".repeat(64)));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("""
+                INSERT INTO invitaciones (email_destinatario, rol_id, creado_por_usuario_id, token_hash,
+                    fecha_creacion, fecha_expiracion, usada)
+                SELECT email_destinatario, rol_id, creado_por_usuario_id, token_hash,
+                    fecha_creacion, fecha_expiracion, 0 FROM invitaciones WHERE token_hash = ?
+                """, "a".repeat(64)));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("""
+                INSERT INTO recuperaciones_password (usuario_id, token_hash, fecha_creacion, fecha_expiracion, usada)
+                SELECT -1, ?, fecha_creacion, fecha_expiracion, 0 FROM recuperaciones_password WHERE token_hash = ?
+                """, "c".repeat(64), "b".repeat(64)));
+    }
+
+    private void verificarBloqueo(TransactionTemplate tx, Runnable marcar,
+                                   java.util.function.Supplier<Boolean> leerUsada) throws Exception {
+        var inicio = new CountDownLatch(1);
+        var futura = new AtomicReference<Future<Boolean>>();
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            tx.executeWithoutResult(status -> {
+                marcar.run();
+                futura.set(executor.submit(() -> {
+                    inicio.countDown();
+                    return tx.execute(estado -> leerUsada.get());
+                }));
+                try {
+                    assertTrue(inicio.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(exception);
+                }
+                assertThrows(TimeoutException.class, () -> futura.get().get(500, TimeUnit.MILLISECONDS));
+            });
+            assertTrue(futura.get().get(10, TimeUnit.SECONDS));
         }
     }
 

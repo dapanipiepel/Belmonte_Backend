@@ -114,6 +114,21 @@ class GatewayRoutingTest {
     }
 
     @Test
+    void routesIdentityPostsWithoutExposingInternalSessionValidation() throws Exception {
+        for (String path : List.of("/api/invitaciones", "/api/auth/activar",
+                "/api/auth/recuperacion", "/api/auth/recuperacion/cambiar")) {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+            HttpResponse<String> response = HttpClient.newHttpClient()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, response.statusCode());
+            assertEquals("usuarios:POST:" + path + ":application/json:{}", response.body());
+        }
+        assertEquals(404, send("/api/auth/sessions/activa/validate").statusCode());
+    }
+
+    @Test
     void bindsConfiguredTimeouts() {
         assertEquals(3000, httpClientProperties.getConnectTimeout());
         assertEquals(Duration.ofSeconds(10), httpClientProperties.getResponseTimeout());

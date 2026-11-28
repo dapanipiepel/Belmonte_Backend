@@ -39,6 +39,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/activar",
+                                "/api/auth/recuperacion", "/api/auth/recuperacion/cambiar").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/logout").authenticated()
                         .requestMatchers(HttpMethod.GET, "/api/auth/sessions/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/internal/conductores/**").permitAll()
@@ -51,6 +53,7 @@ public class SecurityConfig {
                             .hasAnyRole("ADMINISTRADOR", "SOLICITANTE")
                         .requestMatchers("/api/personas", "/api/personas/**", "/api/roles", "/api/roles/**")
                             .hasRole("ADMINISTRADOR")
+                        .requestMatchers("/api/invitaciones", "/api/invitaciones/**").hasRole("ADMINISTRADOR")
                         .requestMatchers(HttpMethod.POST, "/api/paises/**", "/api/tipos-documento/**")
                             .hasRole("ADMINISTRADOR")
                         .requestMatchers(HttpMethod.POST, "/api/usuarios/**")

@@ -28,6 +28,16 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET en .env}
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Configure INTERNAL_API_SECRET en .env}
       VIAJES_SERVICE_URI: http://viajes-service:8083
+      SMTP_HOST: ${SMTP_HOST:-localhost}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_AUTH: ${SMTP_AUTH:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      SMTP_STARTTLS_REQUIRED: ${SMTP_STARTTLS_REQUIRED:-false}
+      SMTP_FROM: ${SMTP_FROM:-no-reply@localhost}
+      ACTIVACION_URL: ${ACTIVACION_URL:-http://localhost:3000/activar}
+      RECUPERACION_URL: ${RECUPERACION_URL:-http://localhost:3000/recuperar}
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:

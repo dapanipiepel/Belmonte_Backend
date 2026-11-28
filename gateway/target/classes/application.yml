@@ -16,7 +16,7 @@ spring:
             - id: usuarios
               uri: ${USUARIOS_SERVICE_URI}
               predicates:
-                - Path=/api/auth/**,/api/usuarios/**,/api/personas/**,/api/roles/**,/api/paises/**,/api/tipos-documento/**,/api/comunas/**,/api/empresas/**,/api/pasajeros/**,/api/conductores/**
+                - Path=/api/auth/login,/api/auth/logout,/api/auth/activar,/api/auth/recuperacion,/api/auth/recuperacion/cambiar,/api/invitaciones/**,/api/usuarios/**,/api/personas/**,/api/roles/**,/api/paises/**,/api/tipos-documento/**,/api/comunas/**,/api/empresas/**,/api/pasajeros/**,/api/conductores/**
             - id: vehiculos
               uri: ${VEHICULOS_SERVICE_URI}
               predicates:

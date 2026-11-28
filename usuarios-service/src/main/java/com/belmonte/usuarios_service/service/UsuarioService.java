@@ -58,6 +58,7 @@ public class UsuarioService {
         this.reloj = reloj;
     }
 
+    @Transactional
     public Usuario registrarUsuario(Usuario usuario) {
 
         if (usuario.getIdUsuario() != null) {
@@ -92,7 +93,7 @@ public class UsuarioService {
         }
 
         Persona persona = personaRepository
-                .findById(usuario.getPersona().getIdPersona())
+                .findForUpdate(usuario.getPersona().getIdPersona())
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND,
                         "La persona no existe"
