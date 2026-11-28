@@ -73,12 +73,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                     Long id = null;
                     if (usuarioId instanceof Integer value) id = value.longValue();
                     else if (usuarioId instanceof Long value) id = value;
-                    if (id != null && id.equals(session.getUsuario().getIdUsuario())) {
+                    if (id != null && id > 0 && id.equals(session.getUsuario().getIdUsuario())) {
                         var vencimiento = claims.getExpiration() == null ? null
                                 : claims.getExpiration().toInstant().atOffset(ZoneOffset.UTC);
                         authentication.setDetails(new IdentidadSesion(id, sessionId, vencimiento));
+                        SecurityContextHolder.getContext().setAuthentication(authentication);
                     }
-                    SecurityContextHolder.getContext().setAuthentication(authentication);
                 }
             } catch (DataAccessException exception) {
                 SecurityContextHolder.clearContext();

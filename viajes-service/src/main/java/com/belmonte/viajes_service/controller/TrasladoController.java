@@ -8,6 +8,10 @@ import com.belmonte.viajes_service.dto.TrasladoResponse;
 import com.belmonte.viajes_service.service.TrasladoService;
 import com.belmonte.viajes_service.service.AsignacionIdempotenteService;
 import com.belmonte.viajes_service.service.AsignacionOperacionTransacciones;
+import com.belmonte.viajes_service.service.CreacionIdempotenteService;
+import com.belmonte.viajes_service.service.CreacionOperacionTransacciones;
+import com.belmonte.viajes_service.service.CambioTrasladoIdempotenteService;
+import com.belmonte.viajes_service.service.CambioTrasladoTransacciones;
 import com.belmonte.viajes_service.security.IdentidadSesion;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
@@ -15,12 +19,16 @@ import io.jsonwebtoken.security.Keys;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -36,6 +44,7 @@ import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/traslados")
@@ -43,13 +52,19 @@ public class TrasladoController {
 
     private final TrasladoService trasladoService;
     private final AsignacionIdempotenteService asignaciones;
+    private final CreacionIdempotenteService creaciones;
+    private final CambioTrasladoIdempotenteService cambios;
     private final SecretKey key;
 
     public TrasladoController(TrasladoService trasladoService,
                               AsignacionIdempotenteService asignaciones,
+                              CreacionIdempotenteService creaciones,
+                              CambioTrasladoIdempotenteService cambios,
                               @Value("${jwt.secret}") String secret) {
         this.trasladoService = trasladoService;
         this.asignaciones = asignaciones;
+        this.creaciones = creaciones;
+        this.cambios = cambios;
         try {
             byte[] keyBytes = MessageDigest.getInstance("SHA-256")
                     .digest(secret.getBytes(StandardCharsets.UTF_8));
@@ -60,15 +75,26 @@ public class TrasladoController {
     }
 
     @PostMapping
-    public ResponseEntity<TrasladoResponse> crear(
+    public ResponseEntity<String> crear(
             @Valid @RequestBody TrasladoRequest request,
             @RequestHeader(value = "Idempotency-Key", required = false) String key,
             @RequestHeader(value = "Authorization", required = false) String authorization) {
         Long usuarioId = usuarioId(authorization);
-        var traslado = trasladoService.crear(request, usuarioId, key);
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .body(TrasladoResponse.from(
-                        traslado, trasladoService.estadoActual(traslado)));
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !(authentication.getDetails() instanceof IdentidadSesion identidad)
+                || identidad.sesionId() == null || identidad.sesionId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Sesion invalida");
+        }
+        var resultado = creaciones.crear(key, usuarioId, identidad.sesionId(), identidad.jwtExpiraEn(), request);
+        return ResponseEntity.status(resultado.codigo()).contentType(MediaType.APPLICATION_JSON)
+                .body(resultado.cuerpo());
+    }
+
+    @GetMapping("/operaciones/creacion")
+    public CreacionOperacionTransacciones.Consulta consultarCreacion(
+            @RequestParam("clave") String clave,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        return creaciones.consultar(clave, usuarioId(authorization));
     }
 
     @GetMapping
@@ -159,7 +185,7 @@ public class TrasladoController {
     }
 
     @PatchMapping("/{id}/estado")
-    public TrasladoResponse cambiarEstado(
+    public ResponseEntity<String> cambiarEstado(
             @PathVariable Long id,
             @Valid @RequestBody EstadoRequest request,
             @RequestHeader(value = "Authorization", required = false) String authorization,
@@ -170,23 +196,41 @@ public class TrasladoController {
                     "Solo conductores pueden cambiar el estado");
         }
         Long usuarioId = usuarioId(authorization);
-        var traslado = trasladoService.cambiarEstado(
-                id, request, usuarioId, usuarioId, idempotencyKey);
-        return TrasladoResponse.from(
-                traslado, trasladoService.estadoActual(traslado));
+        var resultado = cambios.cambiarEstado(idempotencyKey, usuarioId, id, request);
+        return ResponseEntity.status(resultado.codigo()).contentType(MediaType.APPLICATION_JSON).body(resultado.cuerpo());
     }
 
     @PostMapping("/{id}/cancelar")
-    public TrasladoResponse cancelar(
+    public ResponseEntity<String> cancelar(
             @PathVariable Long id,
             @Valid @RequestBody CancelacionRequest request,
             @RequestHeader(value = "Authorization", required = false) String authorization,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         Long usuarioId = usuarioId(authorization);
-        var cancelado = trasladoService.cancelar(
-                id, request, usuarioId, hasRole("ADMINISTRADOR"), hasRole("CONDUCTOR"), idempotencyKey);
-        return TrasladoResponse.from(
-                cancelado, trasladoService.estadoActual(cancelado));
+        var resultado = cambios.cancelar(idempotencyKey, usuarioId, id, request,
+                hasRole("ADMINISTRADOR"), hasRole("SOLICITANTE"), hasRole("CONDUCTOR"));
+        return ResponseEntity.status(resultado.codigo()).contentType(MediaType.APPLICATION_JSON).body(resultado.cuerpo());
+    }
+
+    @GetMapping("/operaciones/cancelacion")
+    public ResponseEntity<CambioTrasladoTransacciones.Consulta> consultarCancelacion(
+            @RequestParam("clave") String clave,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(cambios.consultar(clave, usuarioId(authorization), "cancelar"));
+    }
+
+    @GetMapping("/operaciones/estado")
+    public ResponseEntity<CambioTrasladoTransacciones.Consulta> consultarEstado(
+            @RequestParam("clave") String clave,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(cambios.consultar(clave, usuarioId(authorization), "estado"));
+    }
+
+    @ExceptionHandler({MethodArgumentNotValidException.class, HttpMessageNotReadableException.class})
+    public ResponseEntity<Map<String, String>> solicitudInvalida() {
+        return ResponseEntity.badRequest().body(Map.of("error", "Solicitud de traslado invalida"));
     }
 
     private Long usuarioId(String authorization) {

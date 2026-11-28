@@ -10,11 +10,15 @@ import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "personas")
+@Table(name = "personas", uniqueConstraints = {
+        @UniqueConstraint(name = "uq_personas_documento", columnNames = {"pais_documento_id", "tipo_documento_id", "rut_dni"}),
+        @UniqueConstraint(name = "uq_personas_email", columnNames = "email")
+})
 public class Persona {
 
     @Id
@@ -39,7 +43,7 @@ public class Persona {
     @Column(name = "telefono", length = 20)
     private String telefono;
 
-    @Column(name = "email", nullable = false, unique = true, length = 120)
+    @Column(name = "email", nullable = false, length = 120)
     private String email;
 
     @Column(name = "fecha_creacion", nullable = false, updatable = false)

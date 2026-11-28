@@ -1,6 +1,7 @@
 package com.belmonte.viajes_service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -10,6 +11,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -28,6 +32,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import jakarta.persistence.EntityManagerFactory;
 
@@ -54,7 +59,14 @@ import org.springframework.orm.jpa.EntityManagerHolder;
 import com.belmonte.viajes_service.service.AsignacionOperacionTransacciones;
 import com.belmonte.viajes_service.service.AsignacionIdempotenteService;
 import com.belmonte.viajes_service.service.BarreraRecursoService;
+import com.belmonte.viajes_service.service.CreacionIdempotenteService;
+import com.belmonte.viajes_service.service.CambioTrasladoIdempotenteService;
+import com.belmonte.viajes_service.service.ValidacionRecursosClient;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import com.belmonte.viajes_service.dto.AsignacionRequest;
+import com.belmonte.viajes_service.dto.CancelacionRequest;
+import com.belmonte.viajes_service.dto.EstadoRequest;
+import com.belmonte.viajes_service.dto.TrasladoResponse;
 import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.ObjectMapper;
 
@@ -69,6 +81,7 @@ class AsignacionAuthenticationTest {
     private static volatile boolean recursosCaidos;
     private static volatile CountDownLatch conductorConsultado;
     private static volatile CountDownLatch continuarConsulta;
+    private static final AtomicInteger consultasComuna = new AtomicInteger();
 
     @Autowired
     private MockMvc mvc;
@@ -78,10 +91,13 @@ class AsignacionAuthenticationTest {
 
     @Autowired
     private JdbcTemplate jdbc;
-    @Autowired private ObjectMapper json;
+    @MockitoSpyBean private ObjectMapper json;
     @Autowired private AsignacionOperacionTransacciones operaciones;
     @Autowired private AsignacionIdempotenteService asignaciones;
     @Autowired private BarreraRecursoService barreras;
+    @Autowired private CreacionIdempotenteService creaciones;
+    @Autowired private CambioTrasladoIdempotenteService cambios;
+    @MockitoSpyBean private ValidacionRecursosClient validacionRecursos;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private DataSource dataSource;
     @Autowired private EntityManagerFactory entityManagerFactory;
@@ -118,6 +134,7 @@ class AsignacionAuthenticationTest {
 
         var creation = mvc.perform(post("/api/traslados")
                         .header("Authorization", authorization)
+                        .header("Idempotency-Key", "crear-inicial")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"origen":{"comunaId":1,"direccion":"Origen"},
@@ -143,6 +160,218 @@ class AsignacionAuthenticationTest {
 
         assertEquals(2, jdbc.queryForObject(
                 "SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?", Integer.class, id));
+    }
+
+    @Test
+    void creacionConservaRespuestaYDetectaCambioDeSolicitud() throws Exception {
+        String authorization = "Bearer " + token("activa", "ADMINISTRADOR");
+        String clave = UUID.randomUUID().toString();
+        String body = creacionBody(1, 2);
+        mvc.perform(post("/api/traslados").header("Authorization", authorization)
+                .contentType(MediaType.APPLICATION_JSON).content(body)).andExpect(status().isBadRequest());
+        String original = mvc.perform(creacion(clave, authorization, body))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        long id = json.readTree(original).get("id").asLong();
+        mvc.perform(post("/api/traslados/{id}/cancelar", id).header("Authorization", authorization)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON).content("{\"motivo\":\"Prueba\"}"))
+                .andExpect(status().isOk());
+        try {
+            recursosCaidos = true;
+            String repetida = mvc.perform(creacion(clave, authorization, body))
+                    .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+            assertEquals(original, repetida);
+            mvc.perform(creacion(clave, authorization, creacionBody(1, 3)))
+                    .andExpect(status().isConflict());
+            mvc.perform(get("/api/traslados/operaciones/creacion").param("clave", clave)
+                    .header("Authorization", authorization))
+                    .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("COMPLETADA"))
+                    .andExpect(jsonPath("$.resultado.estado").value("PENDIENTE"));
+            mvc.perform(get("/api/traslados/operaciones/creacion").param("clave", clave)
+                    .header("Authorization", "Bearer " + token("activa", "SOLICITANTE", 8)))
+                    .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+        } finally {
+            recursosCaidos = false;
+        }
+    }
+
+    @Test
+    void creacionValidaAmbasComunasYNoRecuperaPendientesInciertas() throws Exception {
+        String authorization = "Bearer " + token("activa", "ADMINISTRADOR");
+        doAnswer(invocation -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            return invocation.callRealMethod();
+        }).when(validacionRecursos).validarComunas(anyLong(), anyLong());
+        for (String body : List.of(creacionBody(990001, 2), creacionBody(1, 990001))) {
+            String clave = UUID.randomUUID().toString();
+            String error = mvc.perform(creacion(clave, authorization, body)).andExpect(status().isNotFound())
+                    .andReturn().getResponse().getContentAsString();
+            assertEquals(error, mvc.perform(creacion(clave, authorization, body)).andExpect(status().isNotFound())
+                    .andReturn().getResponse().getContentAsString());
+        }
+        for (long comuna : List.of(990002L, 990003L, 990004L, 990005L)) {
+            String clave = UUID.randomUUID().toString();
+            String body = creacionBody(1, comuna);
+            mvc.perform(creacion(clave, authorization, body)).andExpect(status().isServiceUnavailable());
+            mvc.perform(get("/api/traslados/operaciones/creacion").param("clave", clave)
+                    .header("Authorization", authorization))
+                    .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("PENDIENTE"));
+            mvc.perform(creacion(clave, authorization, body)).andExpect(status().isServiceUnavailable());
+        }
+        String incierta = UUID.randomUUID().toString();
+        try {
+            recursosCaidos = true;
+            mvc.perform(creacion(incierta, authorization, creacionBody(1, 2)))
+                    .andExpect(status().isServiceUnavailable());
+        } finally {
+            recursosCaidos = false;
+        }
+        int consultasAlReintentar = consultasComuna.get();
+        mvc.perform(creacion(incierta, authorization, creacionBody(1, 2)))
+                .andExpect(status().isServiceUnavailable());
+        assertEquals(consultasAlReintentar, consultasComuna.get());
+        String invalida = creacionBody(1, 2).replace("2026-12-01T11:00:00-03:00", "2026-12-01T09:00:00-03:00");
+        String claveInvalida = UUID.randomUUID().toString();
+        String rechazo = mvc.perform(creacion(claveInvalida, authorization, invalida)).andExpect(status().isBadRequest())
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(rechazo, mvc.perform(creacion(claveInvalida, authorization, invalida))
+                .andExpect(status().isBadRequest()).andReturn().getResponse().getContentAsString());
+        int consultasAntes = consultasComuna.get();
+        mvc.perform(creacion(UUID.randomUUID().toString(), authorization, creacionBody(1, 1)))
+                .andExpect(status().isCreated());
+        assertEquals(1, consultasComuna.get() - consultasAntes);
+        assertThrows(IllegalTransactionStateException.class, () -> new TransactionTemplate(transactionManager)
+                .executeWithoutResult(status -> creaciones.crear("clave", 7L, "activa", null, null)));
+    }
+
+    @Test
+    void creacionExpiradaConservaMarcaYOperacionesAntiguasNoSonVerificables() throws Exception {
+        String authorization = "Bearer " + token("activa", "ADMINISTRADOR");
+        String clave = UUID.randomUUID().toString();
+        String body = creacionBody(1, 2);
+        mvc.perform(creacion(clave, authorization, body)).andExpect(status().isCreated());
+        OffsetDateTime vencimiento = jdbc.queryForObject(
+                "SELECT expira_en FROM operaciones_traslados WHERE clave = ?", OffsetDateTime.class, clave);
+        assertTrue(vencimiento.isAfter(OffsetDateTime.now().plusDays(29).plusHours(23)));
+        assertTrue(vencimiento.isBefore(OffsetDateTime.now().plusDays(30).plusMinutes(1)));
+        jdbc.update("UPDATE operaciones_traslados SET expira_en = ? WHERE clave = ?",
+                OffsetDateTime.now().minusSeconds(1), clave);
+        mvc.perform(get("/api/traslados/operaciones/creacion").param("clave", clave)
+                .header("Authorization", authorization))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+        mvc.perform(creacion(clave, authorization, body)).andExpect(status().isConflict());
+        assertEquals("EXPIRADA", jdbc.queryForObject(
+                "SELECT estado_operacion FROM operaciones_traslados WHERE clave = ?", String.class, clave));
+
+        String antigua = UUID.randomUUID().toString();
+        jdbc.update("INSERT INTO operaciones_traslados (clave, actor_id, operacion, respuesta_codigo, creado_en) "
+                + "VALUES (?, 7, 'crear', 201, ?)", antigua, OffsetDateTime.now());
+        mvc.perform(creacion(antigua, authorization, body)).andExpect(status().isConflict());
+    }
+
+    @Test
+    void creacionConcurrenteNoDuplicaTraslados() throws Exception {
+        String authorization = "Bearer " + token("activa", "ADMINISTRADOR");
+        String clave = UUID.randomUUID().toString();
+        String body = creacionBody(1, 2);
+        int antes = jdbc.queryForObject("SELECT COUNT(*) FROM traslados", Integer.class);
+        var executor = Executors.newFixedThreadPool(2);
+        CountDownLatch inicio = new CountDownLatch(1);
+        try {
+            var tareas = new java.util.ArrayList<java.util.concurrent.Future<HttpResponse<String>>>();
+            for (int i = 0; i < 2; i++) {
+                tareas.add(executor.submit(() -> {
+                    inicio.await();
+                    HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/traslados"))
+                            .header("Authorization", authorization).header("Idempotency-Key", clave)
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(body)).build();
+                    return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+                }));
+            }
+            inicio.countDown();
+            var primera = tareas.get(0).get(20, TimeUnit.SECONDS);
+            var segunda = tareas.get(1).get(20, TimeUnit.SECONDS);
+            assertTrue(List.of(201, 503).contains(primera.statusCode()));
+            assertTrue(List.of(201, 503).contains(segunda.statusCode()));
+            assertTrue(primera.statusCode() == 201 || segunda.statusCode() == 201);
+            String resultado = primera.statusCode() == 201 ? primera.body() : segunda.body();
+            assertEquals(resultado, mvc.perform(creacion(clave, authorization, body)).andExpect(status().isCreated())
+                    .andReturn().getResponse().getContentAsString());
+            assertEquals(antes + 1, jdbc.queryForObject("SELECT COUNT(*) FROM traslados", Integer.class));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private String creacionBody(long origen, long destino) {
+        return """
+                {"origen":{"comunaId":%d,"direccion":"Origen"},
+                 "destino":{"comunaId":%d,"direccion":"Destino"},
+                 "fechaHoraViaje":"2026-12-01T10:00:00-03:00",
+                 "fechaHoraTerminoEstimado":"2026-12-01T11:00:00-03:00","pasajeroIds":[101]}
+                """.formatted(origen, destino);
+    }
+
+    private org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder creacion(
+            String clave, String authorization, String body) {
+        return post("/api/traslados").header("Authorization", authorization)
+                .header("Idempotency-Key", clave).contentType(MediaType.APPLICATION_JSON).content(body);
+    }
+
+    @Test
+    void soloAdministradorYSolicitantePuedenCrearTraslados() throws Exception {
+        String body = creacionBody(1, 2);
+        mvc.perform(post("/api/traslados").header("Idempotency-Key", UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON).content(body)).andExpect(status().isUnauthorized());
+        mvc.perform(creacion(UUID.randomUUID().toString(), "Bearer " + token("revocada", "SOLICITANTE"), body))
+                .andExpect(status().isUnauthorized());
+        for (String role : List.of("CONDUCTOR", "OTRO")) {
+            String clave = UUID.randomUUID().toString();
+            mvc.perform(creacion(clave, "Bearer " + token("activa", role), body))
+                    .andExpect(status().isForbidden());
+            assertEquals(0, jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM operaciones_traslados WHERE clave = ?", Integer.class, clave));
+        }
+        mvc.perform(creacion(UUID.randomUUID().toString(), "Bearer " + token("activa", "SOLICITANTE"), body))
+                .andExpect(status().isCreated());
+    }
+
+    @Test
+    void validaPasajerosEnLoteYConservaElResultado() throws Exception {
+        String auth = "Bearer " + token("activa", "SOLICITANTE");
+        doAnswer(invocation -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            return invocation.callRealMethod();
+        }).when(validacionRecursos).validarPasajeros(org.mockito.ArgumentMatchers.anySet());
+        String clave = UUID.randomUUID().toString();
+        String inexistente = creacionBody(1, 2).replace("[101]", "[101,990021]");
+        String rechazo = mvc.perform(creacion(clave, auth, inexistente)).andExpect(status().isNotFound())
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(rechazo, mvc.perform(creacion(clave, auth, inexistente)).andExpect(status().isNotFound())
+                .andReturn().getResponse().getContentAsString());
+        for (long id : List.of(990022L, 990023L, 990024L, 990025L)) {
+            String pendiente = UUID.randomUUID().toString();
+            String body = creacionBody(1, 2).replace("[101]", "[101," + id + "]");
+            mvc.perform(creacion(pendiente, auth, body)).andExpect(status().isServiceUnavailable());
+            mvc.perform(get("/api/traslados/operaciones/creacion").param("clave", pendiente)
+                    .header("Authorization", auth)).andExpect(status().isOk())
+                    .andExpect(jsonPath("$.estado").value("PENDIENTE"));
+        }
+        String cincuenta = java.util.stream.IntStream.rangeClosed(1, 50)
+                .mapToObj(Integer::toString).collect(java.util.stream.Collectors.joining(","));
+        mvc.perform(creacion(UUID.randomUUID().toString(), auth,
+                creacionBody(1, 2).replace("101", cincuenta))).andExpect(status().isCreated());
+        String claveExcesiva = UUID.randomUUID().toString();
+        String demasiados = creacionBody(1, 2).replace("101", cincuenta + ",51");
+        String error = mvc.perform(creacion(claveExcesiva, auth, demasiados))
+                .andExpect(status().isBadRequest()).andReturn().getResponse().getContentAsString();
+        assertEquals(error, mvc.perform(creacion(claveExcesiva, auth, demasiados))
+                .andExpect(status().isBadRequest()).andReturn().getResponse().getContentAsString());
+        jdbc.update("UPDATE operaciones_traslados SET respuesta_codigo = 201, respuesta_json = ? WHERE clave = ?",
+                "{\"id\":999}", claveExcesiva);
+        mvc.perform(creacion(claveExcesiva, auth, demasiados))
+                .andExpect(status().isCreated()).andExpect(jsonPath("$.id").value(999));
     }
 
     @Test
@@ -220,7 +449,8 @@ class AsignacionAuthenticationTest {
         var first = mvc.perform(assignment(id, "repeticion", authorization, 101, 201))
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
         mvc.perform(post("/api/traslados/{id}/cancelar", id)
-                .header("Authorization", authorization).contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization", authorization).header("Idempotency-Key", UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON)
                 .content("{\"motivo\":\"Prueba\"}")).andExpect(status().isOk());
         var repeated = mvc.perform(assignment(id, "repeticion", authorization, 101, 201))
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
@@ -409,6 +639,7 @@ class AsignacionAuthenticationTest {
         assertEquals(1, jdbc.queryForObject(
                 "SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?", Integer.class, id));
         mvc.perform(post("/api/traslados/{id}/cancelar", anterior).header("Authorization", authorization)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"motivo\":\"Prueba\"}"))
                 .andExpect(status().isOk());
         var repeat = mvc.perform(assignment(id, "rechazada", authorization, 106, 206))
@@ -443,17 +674,21 @@ class AsignacionAuthenticationTest {
         mvc.perform(assignment(first, "inicio-a", admin, 110, 210)).andExpect(status().isOk());
         mvc.perform(assignment(second, "inicio-b", admin, 110, 210)).andExpect(status().isOk());
         mvc.perform(patch("/api/traslados/{id}/estado", first).header("Authorization", conductor)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"estado\":\"EN_CURSO\"}"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("EN_CURSO"));
         mvc.perform(patch("/api/traslados/{id}/estado", second).header("Authorization", conductor)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"estado\":\"EN_CURSO\"}"))
                 .andExpect(status().isConflict());
         mvc.perform(assignment(first, "reasignar-en-curso", admin, 111, 211))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("EN_CURSO"));
         mvc.perform(post("/api/traslados/{id}/cancelar", first).header("Authorization", conductor)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"motivo\":\"Prueba\"}"))
                 .andExpect(status().isForbidden());
         mvc.perform(patch("/api/traslados/{id}/estado", second).header("Authorization", conductor)
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"estado\":\"EN_CURSO\"}"))
                 .andExpect(status().isOk());
         mvc.perform(assignment(first, "reasignar-a-ocupado", admin, 110, 211))
@@ -644,6 +879,7 @@ class AsignacionAuthenticationTest {
                 .andExpect(status().isConflict()).andExpect(jsonPath("$.estado").doesNotExist());
         mvc.perform(post("/api/traslados/{id}/cancelar", id)
                 .header("Authorization", "Bearer " + token("activa", "ADMINISTRADOR"))
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON).content("{\"motivo\":\"Prueba\"}"))
                 .andExpect(status().isOk());
         mvc.perform(put("/internal/barreras/" + operation)
@@ -942,6 +1178,235 @@ class AsignacionAuthenticationTest {
                         "dentro-de-transaccion", 7L, "activa", 1L, new AsignacionRequest(1L, 2L), null)));
     }
 
+    @Test
+    void cancelacionConservaResultadoIntencionPermisosEHistorial() throws Exception {
+        long id = createTrip();
+        long otro = createTrip();
+        String admin = "Bearer " + token("activa", "ADMINISTRADOR");
+        String ajeno = "Bearer " + token("activa", "SOLICITANTE", 8L);
+        String clave = UUID.randomUUID().toString();
+        mvc.perform(post("/api/traslados/{id}/cancelar", id).header("Authorization", admin)
+                .contentType(MediaType.APPLICATION_JSON).content("{\"motivo\":\"Prueba\"}"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(cancelacion(id, UUID.randomUUID().toString(), admin, "ñ".repeat(251)))
+                .andExpect(status().isBadRequest());
+        mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                .header("Authorization", "Bearer " + token("revocada", "ADMINISTRADOR")))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(cancelacion(id, UUID.randomUUID().toString(), ajeno, "Prueba"))
+                .andExpect(status().isForbidden());
+        String original = mvc.perform(cancelacion(id, clave, admin, "Prueba"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.estado").value("CANCELADO"))
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(original, mvc.perform(cancelacion(id, clave, admin, "Prueba"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        mvc.perform(cancelacion(id, clave, admin, "Otro motivo")).andExpect(status().isConflict());
+        mvc.perform(cancelacion(otro, clave, admin, "Prueba")).andExpect(status().isConflict());
+        mvc.perform(cancelacion(id, clave, ajeno, "Prueba")).andExpect(status().isConflict());
+        mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                .header("Authorization", admin)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.estado").value("COMPLETADA"))
+                .andExpect(jsonPath("$.resultado.estado").value("CANCELADO"));
+        mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                .header("Authorization", ajeno)).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+        mvc.perform(get("/api/traslados/operaciones/estado").param("clave", clave)
+                .header("Authorization", admin)).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                Integer.class, id));
+        assertEquals("Prueba", jdbc.queryForObject(
+                "SELECT motivo FROM historial_estados WHERE traslado_id = ? AND motivo IS NOT NULL", String.class, id));
+        assertEquals(7L, jdbc.queryForObject(
+                "SELECT usuario_id FROM historial_estados WHERE traslado_id = ? AND motivo IS NOT NULL", Long.class, id));
+        jdbc.update("UPDATE operaciones_traslados SET expira_en = ? WHERE clave = ?",
+                OffsetDateTime.now().minusDays(1), clave);
+        mvc.perform(cancelacion(id, clave, admin, "Prueba")).andExpect(status().isConflict());
+        mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                .header("Authorization", admin)).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+    }
+
+    @Test
+    void estadoSoloAdmiteTransicionesDeConductorYConservaExitosYRechazos() throws Exception {
+        long id = createTrip();
+        String admin = "Bearer " + token("activa", "ADMINISTRADOR");
+        String conductor = "Bearer " + token("activa", "CONDUCTOR", 390001L);
+        String otro = "Bearer " + token("activa", "CONDUCTOR", 390002L);
+        mvc.perform(assignment(id, UUID.randomUUID().toString(), admin, 390001, 390003))
+                .andExpect(status().isOk());
+        mvc.perform(estado(id, UUID.randomUUID().toString(), admin, "EN_CURSO", null))
+                .andExpect(status().isForbidden());
+        mvc.perform(estado(id, UUID.randomUUID().toString(), otro, "EN_CURSO", null))
+                .andExpect(status().isForbidden());
+        mvc.perform(estado(id, UUID.randomUUID().toString(), conductor, "CANCELADO", null))
+                .andExpect(status().isConflict());
+        String rechazo = UUID.randomUUID().toString();
+        String error = mvc.perform(estado(id, rechazo, conductor, "FINALIZADO", null))
+                .andExpect(status().isConflict()).andReturn().getResponse().getContentAsString();
+        String inicio = UUID.randomUUID().toString();
+        String original = mvc.perform(estado(id, inicio, conductor, "EN_CURSO", "Inicio"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(error, mvc.perform(estado(id, rechazo, conductor, "FINALIZADO", null))
+                .andExpect(status().isConflict()).andReturn().getResponse().getContentAsString());
+        mvc.perform(estado(id, inicio, conductor, "EN_CURSO", "distinto")).andExpect(status().isConflict());
+        mvc.perform(estado(id, UUID.randomUUID().toString(), conductor, "FINALIZADO", null))
+                .andExpect(status().isOk());
+        assertEquals(original, mvc.perform(estado(id, inicio, conductor, "EN_CURSO", "Inicio"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        mvc.perform(get("/api/traslados/operaciones/estado").param("clave", inicio)
+                .header("Authorization", conductor)).andExpect(jsonPath("$.resultado.estado").value("EN_CURSO"));
+        mvc.perform(cancelacion(id, UUID.randomUUID().toString(), admin, "Tarde"))
+                .andExpect(status().isConflict());
+        assertEquals(4, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                Integer.class, id));
+    }
+
+    @Test
+    void permisosDeCancelacionYClavesAntiguas() throws Exception {
+        String admin = "Bearer " + token("activa", "ADMINISTRADOR");
+        String creador = "Bearer " + token("activa", "SOLICITANTE", 7L);
+        String conductor = "Bearer " + token("activa", "CONDUCTOR", 390021L);
+        long pendiente = createTrip();
+        mvc.perform(cancelacion(pendiente, UUID.randomUUID().toString(), creador, ""))
+                .andExpect(status().isBadRequest());
+        mvc.perform(cancelacion(pendiente, UUID.randomUUID().toString(), conductor, "Prueba"))
+                .andExpect(status().isForbidden());
+        mvc.perform(cancelacion(pendiente, "x".repeat(101), creador, "Prueba"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(cancelacion(pendiente, UUID.randomUUID().toString(), creador, "Prueba"))
+                .andExpect(status().isOk());
+
+        long asignado = createTrip();
+        mvc.perform(assignment(asignado, UUID.randomUUID().toString(), admin, 390021, 390022))
+                .andExpect(status().isOk());
+        mvc.perform(cancelacion(asignado, UUID.randomUUID().toString(), conductor, "Prueba"))
+                .andExpect(status().isOk());
+        String anterior = UUID.randomUUID().toString();
+        jdbc.update("""
+                INSERT INTO operaciones_traslados
+                (clave, actor_id, operacion, traslado_id, respuesta_codigo, creado_en)
+                VALUES (?, 7, 'cancelar', ?, 200, ?)
+                """, anterior, asignado, OffsetDateTime.now());
+        mvc.perform(cancelacion(asignado, anterior, admin, "Prueba")).andExpect(status().isConflict());
+    }
+
+    @Test
+    void cancelacionConcurrenteConMismaClaveSoloRegistraUnaVezYFalloRevierte() throws Exception {
+        long id = createTrip();
+        String clave = UUID.randomUUID().toString();
+        var inicio = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var a = executor.submit(() -> {
+                inicio.await();
+                return cambios.cancelar(clave, 7L, id, new CancelacionRequest("Prueba"), true, false, false);
+            });
+            var b = executor.submit(() -> {
+                inicio.await();
+                return cambios.cancelar(clave, 7L, id, new CancelacionRequest("Prueba"), true, false, false);
+            });
+            inicio.countDown();
+            assertEquals(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS));
+        }
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                Integer.class, id));
+        long otro = createTrip();
+        String fallida = UUID.randomUUID().toString();
+        doAnswer(invocation -> {
+            if (invocation.getArgument(0) instanceof TrasladoResponse) {
+                throw new IllegalStateException("Fallo simulado de serializacion");
+            }
+            return invocation.callRealMethod();
+        }).when(json).writeValueAsString(any());
+        assertThrows(IllegalStateException.class, () -> cambios.cancelar(fallida, 7L, otro,
+                new CancelacionRequest("Prueba"), true, false, false));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                Integer.class, otro));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM operaciones_traslados WHERE clave = ?",
+                Integer.class, fallida));
+    }
+
+    @Test
+    void consultaNoDisponibleNoDescartaSolicitudEnTransito() throws Exception {
+        long id = createTrip();
+        String clave = UUID.randomUUID().toString();
+        String authorization = "Bearer " + token("simultanea", "ADMINISTRADOR");
+        var bloqueado = new CountDownLatch(1);
+        var liberar = new CountDownLatch(1);
+        simultaneousSessions = new CountDownLatch(1);
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var bloqueo = executor.submit(() -> new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                jdbc.queryForObject("SELECT id_estado FROM estados_traslado WHERE codigo_estado = 'PENDIENTE' FOR UPDATE",
+                        Long.class);
+                bloqueado.countDown();
+                try {
+                    if (!liberar.await(15, TimeUnit.SECONDS)) throw new IllegalStateException("Espera agotada");
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(exception);
+                }
+            }));
+            assertTrue(bloqueado.await(10, TimeUnit.SECONDS));
+            var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port
+                            + "/api/traslados/" + id + "/cancelar"))
+                    .header("Authorization", authorization).header("Idempotency-Key", clave)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("{\"motivo\":\"Prueba\"}")).build();
+            var respuesta = HttpClient.newHttpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString());
+            assertTrue(simultaneousSessions.await(10, TimeUnit.SECONDS));
+            mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                    .header("Authorization", authorization)).andExpect(jsonPath("$.estado").value("NO_DISPONIBLE"));
+            liberar.countDown();
+            bloqueo.get(10, TimeUnit.SECONDS);
+            assertEquals(200, respuesta.get(10, TimeUnit.SECONDS).statusCode());
+            mvc.perform(get("/api/traslados/operaciones/cancelacion").param("clave", clave)
+                    .header("Authorization", authorization)).andExpect(jsonPath("$.estado").value("COMPLETADA"));
+            assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                    Integer.class, id));
+        } finally {
+            liberar.countDown();
+            simultaneousSessions = null;
+        }
+    }
+
+    @Test
+    void inicioYCancelacionConcurrentesConservanUnHistorialValido() throws Exception {
+        long id = createTrip();
+        String admin = "Bearer " + token("activa", "ADMINISTRADOR");
+        mvc.perform(assignment(id, UUID.randomUUID().toString(), admin, 390011, 390012))
+                .andExpect(status().isOk());
+        var inicio = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var a = executor.submit(() -> {
+                inicio.await();
+                return cambios.cambiarEstado(UUID.randomUUID().toString(), 390011L, id,
+                        new EstadoRequest("EN_CURSO", null)).codigo();
+            });
+            var b = executor.submit(() -> {
+                inicio.await();
+                return cambios.cancelar(UUID.randomUUID().toString(), 7L, id,
+                        new CancelacionRequest("Prueba"), true, false, false).codigo();
+            });
+            inicio.countDown();
+            int estado = a.get(20, TimeUnit.SECONDS);
+            assertTrue(estado == 200 || estado == 409);
+            assertEquals(200, b.get(20, TimeUnit.SECONDS));
+            assertEquals(estado == 200 ? 4 : 3, jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?", Integer.class, id));
+        }
+    }
+
+    private org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder cancelacion(
+            long id, String clave, String authorization, String motivo) {
+        return post("/api/traslados/{id}/cancelar", id).header("Authorization", authorization)
+                .header("Idempotency-Key", clave).contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(new CancelacionRequest(motivo)));
+    }
+
+    private org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder estado(
+            long id, String clave, String authorization, String estado, String motivo) {
+        return patch("/api/traslados/{id}/estado", id).header("Authorization", authorization)
+                .header("Idempotency-Key", clave).contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(new EstadoRequest(estado, motivo)));
+    }
+
     private long createTrip() throws Exception {
         return createTrip("2026-12-01T10:00:00-03:00", "2026-12-01T11:00:00-03:00");
     }
@@ -953,6 +1418,7 @@ class AsignacionAuthenticationTest {
     private long createTrip(String inicio, String fin, String pasajeros) throws Exception {
         String response = mvc.perform(post("/api/traslados")
                         .header("Authorization", "Bearer " + token("activa", "ADMINISTRADOR"))
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"origen":{"comunaId":1,"direccion":"Origen"},
@@ -1060,6 +1526,51 @@ class AsignacionAuthenticationTest {
                             + (id.equals("990003") ? "CLIENTE" : "CONDUCTOR")
                             + "\",\"activo\":" + !id.equals("990002") + "}";
                     byte[] data = body.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, data.length);
+                    exchange.getResponseBody().write(data);
+                }
+                exchange.close();
+            });
+            server.createContext("/internal/comunas/", exchange -> {
+                consultasComuna.incrementAndGet();
+                String id = exchange.getRequestURI().getPath().substring("/internal/comunas/".length());
+                if (!INTERNAL_SECRET.equals(exchange.getRequestHeaders().getFirst("X-Belmonte-Internal-Secret"))) {
+                    exchange.sendResponseHeaders(403, -1);
+                } else if (recursosCaidos || id.equals("990004")) {
+                    exchange.sendResponseHeaders(503, -1);
+                } else if (id.equals("990001")) {
+                    exchange.sendResponseHeaders(404, -1);
+                } else {
+                    if (id.equals("990005")) {
+                        try {
+                            Thread.sleep(4000);
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                            exchange.close();
+                            return;
+                        }
+                    }
+                    String body = id.equals("990002") ? "{"
+                            : "{\"idComuna\":" + (id.equals("990003") ? "1" : id) + "}";
+                    byte[] data = body.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, data.length);
+                    exchange.getResponseBody().write(data);
+                }
+                exchange.close();
+            });
+            server.createContext("/internal/pasajeros/validar", exchange -> {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                if (!INTERNAL_SECRET.equals(exchange.getRequestHeaders().getFirst("X-Belmonte-Internal-Secret"))) {
+                    exchange.sendResponseHeaders(403, -1);
+                } else if (body.contains("990021")) {
+                    exchange.sendResponseHeaders(404, -1);
+                } else if (recursosCaidos || body.contains("990025")) {
+                    exchange.sendResponseHeaders(503, -1);
+                } else {
+                    String response = body.contains("990022") ? "{"
+                            : body.contains("990023") ? "{\"ids\":[101,1]}"
+                            : body.contains("990024") ? "{\"ids\":[101,101]}" : body;
+                    byte[] data = response.getBytes(StandardCharsets.UTF_8);
                     exchange.sendResponseHeaders(200, data.length);
                     exchange.getResponseBody().write(data);
                 }

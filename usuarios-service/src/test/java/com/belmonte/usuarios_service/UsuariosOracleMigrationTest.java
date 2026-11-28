@@ -4,11 +4,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
@@ -22,8 +28,16 @@ import java.util.concurrent.Future;
 import com.belmonte.usuarios_service.repository.PersonaRepository;
 import com.belmonte.usuarios_service.repository.UsuarioRepository;
 import com.belmonte.usuarios_service.service.CambioUsuarioTransacciones;
+import com.belmonte.usuarios_service.service.ComunaService;
+import com.belmonte.usuarios_service.service.EmpresaService;
+import com.belmonte.usuarios_service.service.PasajeroService;
+import com.belmonte.usuarios_service.dto.EmpresaRequest;
+import com.belmonte.usuarios_service.dto.PasajeroRequest;
+import com.belmonte.usuarios_service.dto.BusquedaPasajeroRequest;
+import com.belmonte.usuarios_service.security.IdentidadSesion;
 import com.belmonte.usuarios_service.service.JwtService;
 import com.belmonte.usuarios_service.service.DecisionAutorizacionService;
+import com.belmonte.usuarios_service.service.RelojBaseDatos;
 import com.belmonte.usuarios_service.service.UsuarioService;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
@@ -38,6 +52,8 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import tools.jackson.databind.ObjectMapper;
 
 @EnabledIfEnvironmentVariable(named = "BELMONTE_ORACLE_TEST_URL", matches = ".+")
 class UsuariosOracleMigrationTest {
@@ -82,6 +98,10 @@ class UsuariosOracleMigrationTest {
                     + "', TO_TIMESTAMP_TZ('2030-01-02 03:04:05 +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), "
                     + "TIMESTAMP '2030-01-02 03:04:05', 'PREPARADA')");
             statement.executeUpdate("INSERT INTO paises (nombre_pais) VALUES ('Pais migracion sesion')");
+            statement.executeUpdate("INSERT INTO regiones (pais_id, nombre_region) "
+                    + "SELECT id_pais, 'Region migracion' FROM paises WHERE nombre_pais = 'Pais migracion sesion'");
+            statement.executeUpdate("INSERT INTO comunas (region_id, nombre_comuna) "
+                    + "SELECT id_region, 'Comuna migracion' FROM regiones WHERE nombre_region = 'Region migracion'");
             statement.executeUpdate("INSERT INTO tipos_documento (codigo_tipo) VALUES ('MIGSES')");
             statement.executeUpdate("INSERT INTO roles (nombre_rol) VALUES ('ROL_MIG_SES')");
             statement.executeUpdate("INSERT INTO personas (pais_documento_id, tipo_documento_id, rut_dni, nombre_completo, email) "
@@ -128,8 +148,175 @@ class UsuariosOracleMigrationTest {
             Flyway flyway = Flyway.configure().dataSource(url, username, password).load();
             assertEquals(0, flyway.migrate().migrationsExecuted);
             assertTrue(flyway.validateWithResult().validationSuccessful);
+            var comunas = context.getBean(ComunaService.class).listar();
+            assertEquals(1, comunas.size());
+            assertEquals("Comuna migracion", comunas.get(0).nombreComuna());
+            assertEquals("Region migracion", comunas.get(0).nombreRegion());
+            assertTrue(comunas.get(0).idPais() > 0);
+            verificarComunasHttp(context, comunas.get(0));
             verifyConstraintsAndRepository(url, username, password, context);
+            verificarEmpresas(context);
+            verificarPasajeros(context);
         }
+    }
+
+    private void verificarPasajeros(ConfigurableApplicationContext context) throws Exception {
+        var jdbc = context.getBean(JdbcTemplate.class);
+        var pasajeros = context.getBean(PasajeroService.class);
+        jdbc.update("INSERT INTO paises (nombre_pais) VALUES ('Pais pasajeros Oracle')");
+        jdbc.update("INSERT INTO tipos_documento (codigo_tipo) VALUES ('ORACLE-PAS')");
+        long pais = jdbc.queryForObject("SELECT id_pais FROM paises WHERE nombre_pais = 'Pais pasajeros Oracle'", Long.class);
+        long tipo = jdbc.queryForObject("SELECT id_tipo_documento FROM tipos_documento WHERE codigo_tipo = 'ORACLE-PAS'", Long.class);
+        long empresa = jdbc.queryForObject("SELECT id_empresa FROM empresas WHERE rut_empresa = 'ORACLE-TEST-1'", Long.class);
+        jdbc.update("INSERT INTO personas (pais_documento_id, tipo_documento_id, rut_dni, nombre_completo, email) "
+                + "VALUES (?, ?, 'ORACLE-U1', 'Usuario Oracle', 'usuario-pasajeros@example.invalid')", pais, tipo);
+        long persona = jdbc.queryForObject("SELECT id_persona FROM personas WHERE email = 'usuario-pasajeros@example.invalid'",
+                Long.class);
+        long rol = jdbc.queryForObject("SELECT id_rol FROM roles WHERE nombre_rol = 'ADMINISTRADOR'", Long.class);
+        jdbc.update("INSERT INTO usuarios (persona_id, rol_id, password, activo) VALUES (?, ?, ?, 1)",
+                persona, rol, new BCryptPasswordEncoder().encode("password"));
+        long actor = jdbc.queryForObject("SELECT id_usuario FROM usuarios WHERE persona_id = ?", Long.class, persona);
+        jdbc.update("INSERT INTO sesiones_usuario (sesion_id, usuario_id, fecha_inicio, fecha_expiracion, "
+                + "fecha_expiracion_instante, activa) VALUES ('pasajero-oracle', ?, SYSTIMESTAMP, "
+                + "SYSTIMESTAMP + 1, SYSTIMESTAMP + 1, 1)", actor);
+        var identidad = new IdentidadSesion(actor, "pasajero-oracle",
+                context.getBean(RelojBaseDatos.class).ahora().plusMinutes(10));
+        var request = new PasajeroRequest("Pasajero Oracle", pais, tipo, "ORACLE-P1",
+                "pasajero-oracle@example.invalid", "123", empresa);
+        var creado = pasajeros.crear(identidad, request);
+        assertTrue(creado.idPasajero() > 0);
+        assertEquals(409, assertThrows(ResponseStatusException.class, () -> pasajeros.crear(identidad, request))
+                .getStatusCode().value());
+        jdbc.update("INSERT INTO personas (pais_documento_id, tipo_documento_id, rut_dni, nombre_completo, email) "
+                + "VALUES (?, ?, 'ORACLE-U2', 'Otro usuario', 'otro-usuario@example.invalid')", pais, tipo);
+        long otraPersona = jdbc.queryForObject("SELECT id_persona FROM personas WHERE email = 'otro-usuario@example.invalid'", Long.class);
+        jdbc.update("INSERT INTO usuarios (persona_id, rol_id, password, activo) VALUES (?, ?, 'test', 1)", otraPersona, rol);
+        long otroActor = jdbc.queryForObject("SELECT id_usuario FROM usuarios WHERE persona_id = ?", Long.class, otraPersona);
+        jdbc.update("INSERT INTO sesiones_usuario (sesion_id, usuario_id, fecha_inicio, fecha_expiracion, "
+                + "fecha_expiracion_instante, activa) VALUES ('pasajero-oracle-2', ?, SYSTIMESTAMP, "
+                + "SYSTIMESTAMP + 1, SYSTIMESTAMP + 1, 1)", otroActor);
+        var otraIdentidad = new IdentidadSesion(otroActor, "pasajero-oracle-2", identidad.jwtExpiraEn());
+        var carrera = new PasajeroRequest("Pasajero carrera Oracle", pais, tipo, "ORACLE-RACE",
+                "pasajero-race@example.invalid", "789", empresa);
+        CountDownLatch inicioRegistro = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var tareas = new java.util.ArrayList<Future<Integer>>();
+            for (var sesion : List.of(identidad, otraIdentidad)) {
+                tareas.add(executor.submit(() -> {
+                    inicioRegistro.await();
+                    try {
+                        pasajeros.crear(sesion, carrera);
+                        return 201;
+                    } catch (ResponseStatusException exception) {
+                        return exception.getStatusCode().value();
+                    }
+                }));
+            }
+            inicioRegistro.countDown();
+            assertEquals(List.of(201, 409), java.util.stream.Stream.of(
+                    tareas.get(0).get(20, TimeUnit.SECONDS), tareas.get(1).get(20, TimeUnit.SECONDS))
+                    .sorted().toList());
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM personas WHERE email = 'pasajero-race@example.invalid'",
+                Integer.class));
+        var consulta = new BusquedaPasajeroRequest(BusquedaPasajeroRequest.Campo.NOMBRE, "Pasajero Oracle", 0, 50);
+        var resultado = pasajeros.buscar(identidad, consulta);
+        assertEquals(1, resultado.pasajeros().size());
+        assertEquals(creado.idPasajero(), resultado.pasajeros().get(0).idPasajero());
+        int port = Objects.requireNonNull(context.getEnvironment().getProperty("local.server.port", Integer.class));
+        var http = HttpClient.newHttpClient();
+        var login = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/auth/login"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        "{\"email\":\"usuario-pasajeros@example.invalid\",\"password\":\"password\"}")).build();
+        var loginResponse = http.send(login, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, loginResponse.statusCode());
+        String token = context.getBean(ObjectMapper.class).readTree(loginResponse.body()).get("accessToken").asString();
+        String bodyAlta = context.getBean(ObjectMapper.class).writeValueAsString(
+                new PasajeroRequest("Pasajero HTTP Oracle", pais, tipo, "ORACLE-P2",
+                        "pasajero-http-oracle@example.invalid", "456", empresa));
+        var alta = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/pasajeros"))
+                .header("Authorization", "Bearer " + token).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(bodyAlta)).build();
+        var altaResponse = http.send(alta, HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, altaResponse.statusCode());
+        assertTrue(context.getBean(ObjectMapper.class).readTree(altaResponse.body()).get("idPasajero").longValue() > 0);
+        assertEquals(409, http.send(alta, HttpResponse.BodyHandlers.discarding()).statusCode());
+        var buscar = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/pasajeros/busquedas"))
+                .header("Authorization", "Bearer " + token).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"campo\":\"NOMBRE\",\"texto\":\"Pasajero Oracle\",\"pagina\":0,\"tamano\":50}"))
+                .build();
+        var response = http.send(buscar, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        assertEquals(creado.idPasajero(),
+                context.getBean(ObjectMapper.class).readTree(response.body()).get("pasajeros").get(0).get("idPasajero").longValue());
+        for (int i = 0; i < 27; i++) {
+            assertTrue(!pasajeros.buscar(identidad, consulta).limitada());
+        }
+        CountDownLatch inicio = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var tarea = (java.util.concurrent.Callable<Boolean>) () -> {
+                inicio.await();
+                return pasajeros.buscar(identidad, consulta).limitada();
+            };
+            var primero = executor.submit(tarea);
+            var segundo = executor.submit(tarea);
+            inicio.countDown();
+            assertTrue(primero.get(20, TimeUnit.SECONDS) != segundo.get(20, TimeUnit.SECONDS));
+        }
+        assertEquals(30, jdbc.queryForObject("SELECT COUNT(*) FROM auditoria_busqueda_pasajeros "
+                + "WHERE actor_id = ? AND resultado <> 'LIMITADA'", Integer.class, actor));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM auditoria_busqueda_pasajeros "
+                + "WHERE actor_id = ? AND resultado = 'LIMITADA'", Integer.class, actor));
+        assertEquals(429, http.send(buscar, HttpResponse.BodyHandlers.discarding()).statusCode());
+    }
+
+    private void verificarEmpresas(ConfigurableApplicationContext context) {
+        var empresas = context.getBean(EmpresaService.class);
+        var jdbc = context.getBean(JdbcTemplate.class);
+        var request = new EmpresaRequest("ORACLE-TEST-1", "Empresa Oracle", "123", "test@example.invalid");
+        var empresa = empresas.crear(request);
+        assertTrue(empresa.getIdEmpresa() > 0);
+        assertEquals("Empresa Oracle", empresas.buscar(empresa.getIdEmpresa()).getRazonSocial());
+        assertTrue(empresas.listar().stream().anyMatch(item -> item.getIdEmpresa().equals(empresa.getIdEmpresa())));
+        assertEquals(409, assertThrows(ResponseStatusException.class, () -> empresas.crear(request))
+                .getStatusCode().value());
+        String largo = "\u00e9".repeat(150);
+        String semantica = jdbc.queryForObject(
+                "SELECT char_used FROM user_tab_columns WHERE table_name = 'EMPRESAS' AND column_name = 'RAZON_SOCIAL'",
+                String.class);
+        Integer bytes = jdbc.queryForObject("SELECT LENGTHB(?) FROM DUAL", Integer.class, largo);
+        if ("B".equals(semantica) && bytes != null && bytes > 150) {
+            assertEquals(400, assertThrows(ResponseStatusException.class,
+                    () -> empresas.crear(new EmpresaRequest("ORACLE-TEST-2", largo, null, null)))
+                    .getStatusCode().value());
+        }
+    }
+
+    private void verificarComunasHttp(ConfigurableApplicationContext context, ComunaService.Comuna esperada)
+            throws Exception {
+        int port = Objects.requireNonNull(context.getEnvironment().getProperty("local.server.port", Integer.class));
+        URI uri = URI.create("http://127.0.0.1:" + port + "/api/comunas");
+        var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+        var anonima = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(3)).GET().build();
+        assertEquals(401, http.send(anonima, HttpResponse.BodyHandlers.discarding()).statusCode());
+        Long usuarioId = context.getBean(JdbcTemplate.class).queryForObject(
+                "SELECT u.id_usuario FROM usuarios u JOIN personas p ON p.id_persona = u.persona_id "
+                        + "WHERE p.email = ?", Long.class, "migracion@example.invalid");
+        String token = context.getBean(JwtService.class).createToken("migracion@example.invalid", usuarioId,
+                "sesion-v7", List.of("ROL_MIG_SES"), context.getBean(RelojBaseDatos.class).ahora().toInstant());
+        var autenticada = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(3))
+                .header("Authorization", "Bearer " + token).GET().build();
+        var response = http.send(autenticada, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        var json = context.getBean(ObjectMapper.class).readTree(response.body());
+        assertTrue(json.isArray());
+        assertEquals(1, json.size());
+        assertEquals(esperada.idComuna().longValue(), json.get(0).get("idComuna").longValue());
+        assertEquals(esperada.nombreComuna(), json.get(0).get("nombreComuna").asString());
+        assertEquals(esperada.idRegion().longValue(), json.get(0).get("idRegion").longValue());
+        assertEquals(esperada.nombreRegion(), json.get(0).get("nombreRegion").asString());
+        assertEquals(esperada.idPais().longValue(), json.get(0).get("idPais").longValue());
     }
 
     private void verifyConstraintsAndRepository(String url, String username, String password,
@@ -186,6 +373,8 @@ class UsuariosOracleMigrationTest {
             statement.executeUpdate("DELETE FROM personas WHERE email = 'migracion@example.invalid'");
             statement.executeUpdate("DELETE FROM roles WHERE nombre_rol = 'ROL_MIG_SES'");
             statement.executeUpdate("DELETE FROM tipos_documento WHERE codigo_tipo = 'MIGSES'");
+            statement.executeUpdate("DELETE FROM comunas WHERE nombre_comuna = 'Comuna migracion'");
+            statement.executeUpdate("DELETE FROM regiones WHERE nombre_region = 'Region migracion'");
             statement.executeUpdate("DELETE FROM paises WHERE nombre_pais = 'Pais migracion sesion'");
             connection.commit();
             assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(

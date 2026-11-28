@@ -40,6 +40,8 @@ public class SecurityConfig {
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.PUT, "/internal/barreras/*").permitAll()
                         .requestMatchers(HttpMethod.POST, "/internal/barreras/*/cerrar").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/traslados")
+                            .hasAnyRole("ADMINISTRADOR", "SOLICITANTE")
                         .requestMatchers("/api/traslados/**").authenticated()
                         .anyRequest().authenticated())
                 .addFilterBefore(jwtAuthenticationFilter,

@@ -30,9 +30,14 @@ import com.belmonte.viajes_service.repository.UbicacionRepository;
 import com.belmonte.viajes_service.service.AsignacionOperacionTransacciones;
 import com.belmonte.viajes_service.service.AsignacionIdempotenteService;
 import com.belmonte.viajes_service.service.BarreraRecursoService;
+import com.belmonte.viajes_service.service.CreacionIdempotenteService;
+import com.belmonte.viajes_service.service.CambioTrasladoIdempotenteService;
 import com.belmonte.viajes_service.service.TrasladoService;
 import com.belmonte.viajes_service.dto.AsignacionRequest;
 import com.belmonte.viajes_service.dto.CancelacionRequest;
+import com.belmonte.viajes_service.dto.EstadoRequest;
+import com.belmonte.viajes_service.dto.TrasladoRequest;
+import com.belmonte.viajes_service.dto.UbicacionRequest;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -96,9 +101,16 @@ class ViajesOracleMigrationTest {
         resources.createContext("/internal/", exchange -> {
             String path = exchange.getRequestURI().getPath();
             String id = path.substring(path.lastIndexOf('/') + 1);
-            String body = path.startsWith("/internal/conductores/")
-                    ? "{\"usuarioId\":" + id + ",\"rol\":\"CONDUCTOR\",\"activo\":true}"
-                    : "{\"vehiculoId\":" + id + ",\"activo\":true,\"capacidadPasajeros\":10}";
+            String body;
+            if (path.startsWith("/internal/conductores/")) {
+                body = "{\"usuarioId\":" + id + ",\"rol\":\"CONDUCTOR\",\"activo\":true}";
+            } else if (path.startsWith("/internal/comunas/")) {
+                body = "{\"idComuna\":" + id + "}";
+            } else if (path.equals("/internal/pasajeros/validar")) {
+                body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            } else {
+                body = "{\"vehiculoId\":" + id + ",\"activo\":true,\"capacidadPasajeros\":10}";
+            }
             byte[] data = body.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, data.length);
             exchange.getResponseBody().write(data);
@@ -116,9 +128,11 @@ class ViajesOracleMigrationTest {
                 Flyway flyway = Flyway.configure().dataSource(url, username, password).load();
                 assertEquals(0, flyway.migrate().migrationsExecuted);
                 assertTrue(flyway.validateWithResult().validationSuccessful);
-                assertEquals("6", flyway.info().current().getVersion().getVersion());
+                assertEquals("7", flyway.info().current().getVersion().getVersion());
                 verifyConstraints(url, username, password);
                 verifyRepositories(context, url, username, password);
+                verifyConcurrentCreation(context);
+                verifyIdempotentTripChanges(context);
                 verifyAssignmentOperation(context, url, username, password);
                 verifyConcurrentAssignments(context);
                 verifyBarrier(context);
@@ -127,6 +141,86 @@ class ViajesOracleMigrationTest {
         } finally {
             resources.stop(0);
         }
+    }
+
+    private void verifyIdempotentTripChanges(ConfigurableApplicationContext context) throws Exception {
+        var creations = context.getBean(CreacionIdempotenteService.class);
+        var assignments = context.getBean(AsignacionIdempotenteService.class);
+        var changes = context.getBean(CambioTrasladoIdempotenteService.class);
+        var json = context.getBean(tools.jackson.databind.ObjectMapper.class);
+        var jdbc = context.getBean(JdbcTemplate.class);
+        var request = new TrasladoRequest(new UbicacionRequest(1L, "Origen", null, null),
+                new UbicacionRequest(2L, "Destino", null, null),
+                OffsetDateTime.parse("2026-12-01T10:00:00-03:00"),
+                OffsetDateTime.parse("2026-12-01T11:00:00-03:00"), null, Set.of(11L));
+        long id = json.readTree(creations.crear(UUID.randomUUID().toString(), 7L, "activa",
+                OffsetDateTime.now().plusMinutes(10), request).cuerpo()).get("id").asLong();
+        assertEquals(200, assignments.asignar(UUID.randomUUID().toString(), 7L, "activa", id,
+                new AsignacionRequest(812001L, 812002L), null).codigo());
+        String estadoClave = UUID.randomUUID().toString();
+        var estado = changes.cambiarEstado(estadoClave, 812001L, id, new EstadoRequest("EN_CURSO", "Inicio"));
+        assertEquals(200, estado.codigo());
+        String clave = UUID.randomUUID().toString();
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var a = executor.submit(() -> {
+                start.await();
+                return changes.cancelar(clave, 7L, id, new CancelacionRequest("Prueba"), true, false, false);
+            });
+            var b = executor.submit(() -> {
+                start.await();
+                return changes.cancelar(clave, 7L, id, new CancelacionRequest("Prueba"), true, false, false);
+            });
+            start.countDown();
+            var resultado = a.get(30, TimeUnit.SECONDS);
+            assertEquals(200, resultado.codigo());
+            assertEquals(resultado, b.get(30, TimeUnit.SECONDS));
+        }
+        assertEquals(estado, changes.cambiarEstado(estadoClave, 812001L, id, new EstadoRequest("EN_CURSO", "Inicio")));
+        assertEquals("COMPLETADA", changes.consultar(clave, 7L, "cancelar").estado());
+        assertEquals("NO_DISPONIBLE", changes.consultar(clave, 8L, "cancelar").estado());
+        assertEquals(409, assertThrows(ResponseStatusException.class, () -> changes.cancelar(
+                clave, 7L, id, new CancelacionRequest("Otro"), true, false, false)).getStatusCode().value());
+        assertEquals(4, jdbc.queryForObject("SELECT COUNT(*) FROM historial_estados WHERE traslado_id = ?",
+                Integer.class, id));
+        assertEquals("Prueba", jdbc.queryForObject(
+                "SELECT motivo FROM historial_estados WHERE traslado_id = ? AND motivo = 'Prueba'", String.class, id));
+    }
+
+    private void verifyConcurrentCreation(ConfigurableApplicationContext context) throws Exception {
+        var creaciones = context.getBean(CreacionIdempotenteService.class);
+        var jdbc = context.getBean(JdbcTemplate.class);
+        int antes = jdbc.queryForObject("SELECT COUNT(*) FROM traslados", Integer.class);
+        String clave = UUID.randomUUID().toString();
+        var request = new TrasladoRequest(new UbicacionRequest(1L, "Origen", null, null),
+                new UbicacionRequest(2L, "Destino", null, null),
+                OffsetDateTime.parse("2026-12-01T10:00:00-03:00"),
+                OffsetDateTime.parse("2026-12-01T11:00:00-03:00"), null, Set.of(11L));
+        var expira = OffsetDateTime.now().plusMinutes(10);
+        var inicio = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var tareas = new ArrayList<java.util.concurrent.Future<Integer>>();
+            for (int i = 0; i < 2; i++) {
+                tareas.add(executor.submit(() -> {
+                    inicio.await();
+                    try {
+                        return creaciones.crear(clave, 7L, "activa", expira, request).codigo();
+                    } catch (ResponseStatusException exception) {
+                        return exception.getStatusCode().value();
+                    }
+                }));
+            }
+            inicio.countDown();
+            int primera = tareas.get(0).get(30, TimeUnit.SECONDS);
+            int segunda = tareas.get(1).get(30, TimeUnit.SECONDS);
+            assertTrue(List.of(201, 503).contains(primera));
+            assertTrue(List.of(201, 503).contains(segunda));
+            assertTrue(primera == 201 || segunda == 201);
+        }
+        var resultado = creaciones.crear(clave, 7L, "activa", expira, request);
+        assertEquals(201, resultado.codigo());
+        assertEquals("COMPLETADA", creaciones.consultar(clave, 7L).estado());
+        assertEquals(antes + 1, jdbc.queryForObject("SELECT COUNT(*) FROM traslados", Integer.class));
     }
 
     private void verifyConcurrentBarrierAndAssignment(ConfigurableApplicationContext context) throws Exception {
@@ -186,8 +280,8 @@ class ViajesOracleMigrationTest {
                 () -> barreras.preparar(compatible, "VEHICULO", 912002L, "BAJA")).getStatusCode().value());
         String rejected = UUID.randomUUID().toString();
         assertEquals("RECHAZADA", barreras.prepararBaja(rejected, "VEHICULO", 912002L));
-        context.getBean(TrasladoService.class).cancelar(id, new CancelacionRequest("Prueba"),
-                7L, true, false, "oracle-cancelar-barrera");
+        assertEquals(200, context.getBean(CambioTrasladoIdempotenteService.class).cancelar(
+                "oracle-cancelar-barrera", 7L, id, new CancelacionRequest("Prueba"), true, false, false).codigo());
         assertEquals("RECHAZADA", barreras.prepararBaja(rejected, "VEHICULO", 912002L));
         assertEquals(409, assertThrows(ResponseStatusException.class,
                 () -> barreras.cerrar(rejected, "VEHICULO", 912002L)).getStatusCode().value());
@@ -353,6 +447,16 @@ class ViajesOracleMigrationTest {
             assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
                     "INSERT INTO operaciones_traslados (clave, operacion, respuesta_codigo, sesion_original) "
                     + "VALUES ('incompleta', 'asignar', 102, 'sesion')")).getErrorCode());
+            statement.executeUpdate("INSERT INTO operaciones_traslados "
+                    + "(clave, operacion, respuesta_codigo, estado_operacion, sesion_original) "
+                    + "VALUES ('creacion-pendiente', 'crear', 102, 'PENDIENTE', 'sesion')");
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "INSERT INTO operaciones_traslados "
+                    + "(clave, operacion, respuesta_codigo, estado_operacion, sesion_original) "
+                    + "VALUES ('creacion-invalida', 'crear', 201, 'COMPLETADA', 'sesion')")).getErrorCode());
+            assertEquals(2290, assertThrows(SQLException.class, () -> statement.executeUpdate(
+                    "INSERT INTO operaciones_traslados (clave, operacion, respuesta_codigo, sesion_original) "
+                    + "VALUES ('creacion-sin-estado', 'crear', 102, 'sesion')")).getErrorCode());
             try (ResultSet result = statement.executeQuery("SELECT codigo_estado FROM estados_traslado ORDER BY codigo_estado")) {
                 List<String> estados = new ArrayList<>();
                 while (result.next()) {

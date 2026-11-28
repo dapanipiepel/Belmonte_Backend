@@ -63,6 +63,12 @@ class GatewayRoutingTest {
         assertEquals(404, send("/api/unknown").statusCode());
         assertEquals(404, send("/api/auth/sessions/activa/validate").statusCode());
         assertEquals(404, send("/internal/conductores/1").statusCode());
+        assertEquals(404, send("/internal/comunas/1").statusCode());
+        HttpRequest pasajerosInterno = HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + port + "/internal/pasajeros/validar"))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"ids\":[1]}")).build();
+        assertEquals(404, HttpClient.newHttpClient()
+                .send(pasajerosInterno, HttpResponse.BodyHandlers.discarding()).statusCode());
         assertEquals(404, send("/internal/vehiculos/1").statusCode());
         assertEquals(404, send("/internal/barreras/123").statusCode());
         HttpRequest internalPrepare = HttpRequest.newBuilder(
@@ -92,6 +98,19 @@ class GatewayRoutingTest {
         assertEquals("usuarios:POST:/api/usuarios/login?source=android:application/json:{\"usuario\":\"prueba\"}",
                 response.body());
         assertEquals("upstream", response.headers().firstValue("X-Test-Origin").orElseThrow());
+    }
+
+    @Test
+    void routesPassengerSearchInRequestBody() throws Exception {
+        String body = "{\"campo\":\"NOMBRE\",\"texto\":\"prueba\",\"pagina\":0,\"tamano\":50}";
+        HttpRequest request = HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + port + "/api/pasajeros/busquedas"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build();
+        HttpResponse<String> response = HttpClient.newHttpClient()
+                .send(request, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        assertEquals("usuarios:POST:/api/pasajeros/busquedas:application/json:" + body, response.body());
     }
 
     @Test

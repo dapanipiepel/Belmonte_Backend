@@ -10,13 +10,11 @@ import com.belmonte.viajes_service.model.Traslado;
 import com.belmonte.viajes_service.repository.EstadoTrasladoRepository;
 import com.belmonte.viajes_service.repository.BarreraRecursoRepository;
 import com.belmonte.viajes_service.repository.HistorialEstadoRepository;
-import com.belmonte.viajes_service.repository.OperacionTrasladoRepository;
 import com.belmonte.viajes_service.repository.TrasladoRepository;
 import com.belmonte.viajes_service.repository.UbicacionRepository;
 import com.belmonte.viajes_service.service.TrasladoService;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.server.ResponseStatusException;
-import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.OffsetDateTime;
 import java.util.Set;
@@ -33,12 +31,9 @@ class TrasladoServiceTest {
         UbicacionRepository ubicaciones = mock(UbicacionRepository.class);
         EstadoTrasladoRepository estados = mock(EstadoTrasladoRepository.class);
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
-        OperacionTrasladoRepository operaciones =
-                mock(OperacionTrasladoRepository.class);
-
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
+                mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(1L, "Origen", null, null),
@@ -50,7 +45,7 @@ class TrasladoServiceTest {
 
         ResponseStatusException error = assertThrows(
                 ResponseStatusException.class,
-                () -> service.crear(request, 1L, null));
+                () -> service.crear(request, 1L));
         assertEquals(400, error.getStatusCode().value());
     }
 
@@ -60,12 +55,9 @@ class TrasladoServiceTest {
         UbicacionRepository ubicaciones = mock(UbicacionRepository.class);
         EstadoTrasladoRepository estados = mock(EstadoTrasladoRepository.class);
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
-        OperacionTrasladoRepository operaciones =
-                mock(OperacionTrasladoRepository.class);
-
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
+                mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(
@@ -80,7 +72,7 @@ class TrasladoServiceTest {
 
         ResponseStatusException error = assertThrows(
                 ResponseStatusException.class,
-                () -> service.crear(request, 1L, null));
+                () -> service.crear(request, 1L));
         assertEquals(400, error.getStatusCode().value());
     }
 
@@ -90,9 +82,6 @@ class TrasladoServiceTest {
         UbicacionRepository ubicaciones = mock(UbicacionRepository.class);
         EstadoTrasladoRepository estados = mock(EstadoTrasladoRepository.class);
         HistorialEstadoRepository historial = mock(HistorialEstadoRepository.class);
-        OperacionTrasladoRepository operaciones =
-                mock(OperacionTrasladoRepository.class);
-
         when(ubicaciones.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(traslados.saveAndFlush(any())).thenAnswer(invocation -> {
             Traslado traslado = invocation.getArgument(0);
@@ -107,7 +96,7 @@ class TrasladoServiceTest {
 
         TrasladoService service = new TrasladoService(
                 traslados, ubicaciones, estados, historial,
-                operaciones, mock(JdbcTemplate.class), mock(BarreraRecursoRepository.class));
+                mock(BarreraRecursoRepository.class));
 
         TrasladoRequest request = new TrasladoRequest(
                 new UbicacionRequest(1L, "Origen", null, null),
@@ -117,7 +106,7 @@ class TrasladoServiceTest {
                 null,
                 Set.of(101L));
 
-        Traslado creado = service.crear(request, 1L, null);
+        Traslado creado = service.crear(request, 1L);
         assertEquals(10L, creado.getId());
     }
 }

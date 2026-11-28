@@ -7,6 +7,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -62,9 +65,48 @@ public class ValidacionRecursosClient {
         }
     }
 
+    public void validarComunas(Long origen, Long destino) {
+        validarComuna(origen);
+        if (!origen.equals(destino)) {
+            validarComuna(destino);
+        }
+    }
+
+    private void validarComuna(Long id) {
+        JsonNode comuna = consultar(usuariosUri + "/internal/comunas/" + id, "Comuna");
+        validarId(comuna, "idComuna", id);
+    }
+
+    public void validarPasajeros(Set<Long> ids) {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(usuariosUri + "/internal/pasajeros/validar"))
+                .timeout(Duration.ofSeconds(3))
+                .header("X-Belmonte-Internal-Secret", secret)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(Map.of("ids", ids))))
+                .build();
+        JsonNode resultado = consultar(request, "Pasajero");
+        JsonNode recibidos = resultado.get("ids");
+        if (recibidos == null || !recibidos.isArray() || recibidos.size() != ids.size()) {
+            throw respuestaInvalida("pasajeros");
+        }
+        Set<Long> comprobados = new HashSet<>();
+        for (JsonNode id : recibidos) {
+            if (!id.isIntegralNumber() || !id.canConvertToLong() || !comprobados.add(id.longValue())) {
+                throw respuestaInvalida("pasajeros");
+            }
+        }
+        if (!comprobados.equals(ids)) {
+            throw respuestaInvalida("pasajeros");
+        }
+    }
+
     private JsonNode consultar(String uri, String recurso) {
         HttpRequest request = HttpRequest.newBuilder(URI.create(uri)).timeout(Duration.ofSeconds(3))
                 .header("X-Belmonte-Internal-Secret", secret).GET().build();
+        return consultar(request, recurso);
+    }
+
+    private JsonNode consultar(HttpRequest request, String recurso) {
         HttpResponse<String> response;
         try {
             response = http.send(request, HttpResponse.BodyHandlers.ofString());

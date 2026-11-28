@@ -35,6 +35,10 @@ public class PersonaService {
 
     public Persona crearPersona(Persona persona) {
 
+        if (persona.getIdPersona() != null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No se permite indicar el ID al crear una persona");
+        }
+
         if (persona.getNombreCompleto() == null
                 || persona.getNombreCompleto().isBlank()) {
             throw new ResponseStatusException(

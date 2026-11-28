@@ -74,6 +74,12 @@ public class OperacionTraslado {
     public String getSolicitudHash() { return solicitudHash; }
     public String getRespuestaJson() { return respuestaJson; }
     public OffsetDateTime getExpiraEn() { return expiraEn; }
+    public String getSesionOriginal() { return sesionOriginal; }
+
+    public void completarCreacion(Long trasladoId, int codigo, String respuesta, OffsetDateTime expiraEn) {
+        this.trasladoId = trasladoId;
+        completar(codigo, respuesta, expiraEn);
+    }
 
     public void completar(int codigo, String respuesta, OffsetDateTime expiraEn) {
         this.respuestaCodigo = codigo;
